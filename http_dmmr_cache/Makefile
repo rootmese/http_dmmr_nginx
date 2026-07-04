@@ -1,11 +1,19 @@
 CC = gcc
-CFLAGS = -Wall -O2
+CFLAGS = -Wall -Wextra -O2 -pthread
 LDFLAGS = -ldb -lpthread
 
-all: http_dmmr_cache
+TARGET = dmmr_cache
+OBJS = dmmr_net.o dmmr_db.o dmmr_cluster.o dmmr_server.o
 
-http_dmmr_cache: http_dmmr_cache.c
-	$(CC) $(CFLAGS) -o $@ $< $(LDFLAGS)
+all: $(TARGET)
+
+$(TARGET): $(OBJS)
+	$(CC) $(CFLAGS) -o $@ $^ $(LDFLAGS)
+
+%.o: %.c
+	$(CC) $(CFLAGS) -c $< -o $@
 
 clean:
-	rm -f http_dmmr_cache apikeys.db
+	rm -f $(OBJS) $(TARGET)
+
+.PHONY: all clean

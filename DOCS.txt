@@ -45,7 +45,7 @@ location / {
 }
 
 Implementation notes:
-- Berkeley DB is used as the persistence layer
-- The module keeps a reusable connection to the cache daemon when possible
-- Socket failures are handled by closing the broken connection and reconnecting
-- The rate limiting logic uses an in-memory tree and should be evolved to shared memory for multi-worker environments
+- Berkeley DB is used as the persistence layer;
+- The module keeps a reusable connection to the cache daemon when possible;
+- Socket failures are handled by closing the broken connection and reconnecting;
+- The rate limiting logic uses an in-memory tree and should be evolved to shared memory for multi-worker environments.

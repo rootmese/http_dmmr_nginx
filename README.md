@@ -103,6 +103,8 @@ http {
         location / {
             dmmr_enable on;
             dmmr_cache_addr unix:/tmp/dmmr_cache.sock;  # or tcp:127.0.0.1:9080
+            dmmr_rate_limit 120;      # 120 req per window
+            dmmr_rate_window 60000;   # 60s window
             # The $dmmr_upstream variable is resolved at runtime
             proxy_pass http://$dmmr_upstream;
             proxy_set_header Host $host;
@@ -116,10 +118,11 @@ http {
 ---
 
 ## Authentication Flow of the Module
-1. When a request arrives with an API key (via the `apikey`/`x-api-key` header or the `?apikey=` query parameter), the Nginx module performs a fast synchronous request to the address defined by `dmmr_cache_addr`.
-2. The address accepts the formats `unix:/path/to/socket` and `tcp:host:port`.
+1. When a request arrives with a credential, the Nginx module accepts either a bearer token in the `Authorization` header, a legacy `x-api-key`/`apikey` header, or a `token=`/`apikey=` query parameter.
+2. The module sends a binary request to the cache daemon at the address defined by `dmmr_cache_addr` using the new frame format with `magic`, `version`, `opcode`, `key_len` and `timestamp` fields.
 3. If the cache returns `200 OK`, the request is authenticated with the information contained in the response.
 4. If the cache lookup fails, the module falls back to validating against the static keys defined in [nginx-dmmr-module-c/ngx_http_dmmr_auth.c](nginx-dmmr-module-c/ngx_http_dmmr_auth.c).
+5. The rate limiter uses the client IP and the configured `dmmr_rate_limit`/`dmmr_rate_window` values to enforce an RPS-style ceiling per client.
 
 ## Future Work and Roadmap
 A structured roadmap with planned improvements for rate limiting, true keep-alive handling, and thread-safety considerations is available in [ROADMAP.md](ROADMAP.md).

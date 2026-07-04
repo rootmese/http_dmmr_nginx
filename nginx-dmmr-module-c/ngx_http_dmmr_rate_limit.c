@@ -14,8 +14,6 @@ struct ngx_http_dmmr_rate_node_s {
 };
 
 static ngx_http_dmmr_rate_node_t *rate_root = NULL;
-static ngx_msec_t                 rate_window = 60000; /* 1 minuto */
-static ngx_uint_t                 rate_limit = 100;     /* 100 req/minuto */
 
 static ngx_uint_t
 ngx_http_dmmr_rate_bit_at(ngx_str_t *key, ngx_uint_t bit)
@@ -201,11 +199,18 @@ ngx_int_t ngx_http_dmmr_rate_init(ngx_cycle_t *cycle)
 ngx_int_t
 ngx_http_dmmr_rate_limit(ngx_http_request_t *r, ngx_http_dmmr_ctx_t *ctx)
 {
+    ngx_http_dmmr_conf_t *conf;
     ngx_str_t client_key;
     ngx_http_dmmr_rate_node_t *node;
     ngx_msec_t now;
     ngx_int_t found;
+    ngx_uint_t rate_limit;
+    ngx_msec_t rate_window;
     u_char buf[NGX_INET_ADDRSTRLEN];
+
+    conf = ngx_http_get_module_loc_conf(r, ngx_http_dmmr_module);
+    rate_limit = (conf != NULL && conf->rate_limit > 0) ? conf->rate_limit : 100;
+    rate_window = (conf != NULL && conf->rate_window > 0) ? conf->rate_window : 60000;
 
     /* Cria chave = IP + período (minuto) */
     client_key.data = buf;

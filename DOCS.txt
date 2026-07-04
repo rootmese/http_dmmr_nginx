@@ -7,7 +7,7 @@ Repository structure:
 
 Main components:
 1. Nginx module
-   - Handles auth, routing, rate limiting and proxying
+   - Handles auth, routing, rate limiting and proxying with token support and configurable rate windows
    - Reads the directive dmmr_cache_addr
    - Uses the configured cache endpoint for lookups
 

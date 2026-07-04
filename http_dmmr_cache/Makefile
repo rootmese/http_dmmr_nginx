@@ -1,6 +1,6 @@
 CC = gcc
 CFLAGS = -Wall -O2
-LDFLAGS = -lmicrohttpd -ldb
+LDFLAGS = -ldb -lpthread
 
 all: http_dmmr_cache
 

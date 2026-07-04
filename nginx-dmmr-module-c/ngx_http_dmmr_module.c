@@ -158,6 +158,48 @@ ngx_http_dmmr_route(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
     return NGX_CONF_OK;
 }
 
+static char *
+nngx_http_dmmr_rate_limit_set(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
+{
+    ngx_http_dmmr_conf_t *kcf = conf;
+    ngx_str_t *value;
+    ngx_int_t limit;
+
+    value = cf->args->elts;
+    if (cf->args->nelts != 2) {
+        return "invalid number of arguments";
+    }
+
+    limit = ngx_atoi(value[1].data, value[1].len);
+    if (limit <= 0) {
+        return "invalid value";
+    }
+
+    kcf->rate_limit = (ngx_uint_t) limit;
+    return NGX_CONF_OK;
+}
+
+static char *
+ngx_http_dmmr_rate_window_set(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
+{
+    ngx_http_dmmr_conf_t *kcf = conf;
+    ngx_str_t *value;
+    ngx_int_t window;
+
+    value = cf->args->elts;
+    if (cf->args->nelts != 2) {
+        return "invalid number of arguments";
+    }
+
+    window = ngx_atoi(value[1].data, value[1].len);
+    if (window <= 0) {
+        return "invalid value";
+    }
+
+    kcf->rate_window = (ngx_msec_t) window;
+    return NGX_CONF_OK;
+}
+
 /* Comandos de configuração */
 static ngx_command_t ngx_http_dmmr_commands[] = {
     { ngx_string("dmmr_enable"),
@@ -188,6 +230,20 @@ static ngx_command_t ngx_http_dmmr_commands[] = {
       offsetof(ngx_http_dmmr_conf_t, cache_addr),
       NULL },
 
+    { ngx_string("dmmr_rate_limit"),
+      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_TAKE1,
+      ngx_http_dmmr_rate_limit_set,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      0,
+      NULL },
+
+    { ngx_string("dmmr_rate_window"),
+      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_TAKE1,
+      ngx_http_dmmr_rate_window_set,
+      NGX_HTTP_LOC_CONF_OFFSET,
+      0,
+      NULL },
+
     ngx_null_command
 };
 
@@ -206,6 +262,8 @@ ngx_http_dmmr_create_loc_conf(ngx_conf_t *cf)
     kcf->services = NULL;
     kcf->routes = NULL;
     kcf->plugins = NULL;
+    kcf->rate_limit = 100;
+    kcf->rate_window = 60000;
     /* cache_addr.len e cache_addr.data serão 0 e NULL pela alocação via pcalloc */
 
     return kcf;
@@ -230,6 +288,8 @@ ngx_http_dmmr_merge_loc_conf(ngx_conf_t *cf, void *parent, void *child)
     }
 
     ngx_conf_merge_str_value(conf->cache_addr, prev->cache_addr, "unix:/tmp/dmmr_cache.sock");
+    ngx_conf_merge_uint_value(conf->rate_limit, prev->rate_limit, 100);
+    ngx_conf_merge_msec_value(conf->rate_window, prev->rate_window, 60000);
 
     return NGX_CONF_OK;
 }

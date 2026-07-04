@@ -20,7 +20,7 @@ The C module is responsible for:
 - intercepting HTTP requests;
 - deciding which upstream the request should go to;
 - applying authentication;
-- applying rate limiting;
+- applying rate limiting with configurable windows and token-based authentication;
 - forwarding the request to its final destination.
 
 ### 2. Cache Daemon

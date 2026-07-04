@@ -54,6 +54,8 @@ typedef struct {
     ngx_array_t         *plugins;        /* lista de ngx_http_dmmr_plugin_t */
     ngx_str_t            config_file;    /* opcional: arquivo JSON com config */
     ngx_str_t            cache_addr;     /* endereço do cache (ex: unix:/tmp/dmmr_cache.sock ou 127.0.0.1:9080) */
+    ngx_uint_t           rate_limit;     /* limite de requisições por janela */
+    ngx_msec_t           rate_window;    /* janela de rate limit em ms */
 } ngx_http_dmmr_conf_t;
 
 /* Funções públicas */

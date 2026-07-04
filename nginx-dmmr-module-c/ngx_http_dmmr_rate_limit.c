@@ -1,43 +1,200 @@
 #include "ngx_http_dmmr_module.h"
-#include <ngx_rbtree.h>
 #include <ngx_time.h>
 
-/* Estrutura para armazenar contadores */
-typedef struct {
-    ngx_rbtree_node_t  node;
-    ngx_str_t          key;          /* chave = IP + período */
-    ngx_msec_t         timestamp;
-    ngx_uint_t         count;
-} ngx_http_dmmr_rate_node_t;
+/* Estrutura para armazenar contadores em uma Patricia trie compacta */
+typedef struct ngx_http_dmmr_rate_node_s ngx_http_dmmr_rate_node_t;
 
-static ngx_rbtree_t  rate_tree;
-static ngx_rbtree_node_t  rate_sentinel;
-static ngx_msec_t    rate_window = 60000; /* 1 minuto */
-static ngx_uint_t    rate_limit = 100;     /* 100 req/minuto */
+struct ngx_http_dmmr_rate_node_s {
+    ngx_http_dmmr_rate_node_t  *child[2];
+    ngx_uint_t                  bit;
+    ngx_flag_t                  terminal;
+    ngx_str_t                   key;
+    ngx_msec_t                  timestamp;
+    ngx_uint_t                  count;
+};
 
-static void
-ngx_http_dmmr_rate_prune(ngx_rbtree_node_t *node, ngx_msec_t now)
+static ngx_http_dmmr_rate_node_t *rate_root = NULL;
+static ngx_msec_t                 rate_window = 60000; /* 1 minuto */
+static ngx_uint_t                 rate_limit = 100;     /* 100 req/minuto */
+
+static ngx_uint_t
+ngx_http_dmmr_rate_bit_at(ngx_str_t *key, ngx_uint_t bit)
 {
-    ngx_http_dmmr_rate_node_t *rate_node;
-
-    if (node == NULL || node == &rate_sentinel) {
-        return;
+    if (bit >= key->len * 8) {
+        return 0;
     }
 
-    ngx_http_dmmr_rate_prune(node->left, now);
-    ngx_http_dmmr_rate_prune(node->right, now);
+    return (key->data[bit >> 3] >> (7 - (bit & 0x7))) & 0x1;
+}
 
-    rate_node = (ngx_http_dmmr_rate_node_t *) node;
-    if (now - rate_node->timestamp > rate_window) {
-        ngx_rbtree_delete(&rate_tree, &rate_node->node);
-        ngx_free(rate_node->key.data);
-        ngx_free(rate_node);
+static ngx_uint_t
+ngx_http_dmmr_rate_first_diff_bit(ngx_str_t *left, ngx_str_t *right)
+{
+    ngx_uint_t bit;
+    ngx_uint_t max_bits;
+
+    max_bits = ngx_max(left->len, right->len) * 8;
+
+    for (bit = 0; bit < max_bits; bit++) {
+        if (ngx_http_dmmr_rate_bit_at(left, bit) !=
+            ngx_http_dmmr_rate_bit_at(right, bit))
+        {
+            return bit;
+        }
     }
+
+    return max_bits;
+}
+
+static ngx_int_t
+ngx_http_dmmr_rate_key_equal(ngx_str_t *left, ngx_str_t *right)
+{
+    return left->len == right->len
+           && ngx_strncmp(left->data, right->data, left->len) == 0;
+}
+
+static ngx_http_dmmr_rate_node_t *
+ngx_http_dmmr_rate_create_node(ngx_http_request_t *r, ngx_str_t *key,
+                               ngx_msec_t now)
+{
+    ngx_http_dmmr_rate_node_t *node;
+
+    node = ngx_alloc(sizeof(ngx_http_dmmr_rate_node_t), r->connection->log);
+    if (node == NULL) {
+        return NULL;
+    }
+
+    ngx_memzero(node, sizeof(ngx_http_dmmr_rate_node_t));
+
+    node->key.data = ngx_alloc(key->len, r->connection->log);
+    if (node->key.data == NULL) {
+        ngx_free(node);
+        return NULL;
+    }
+
+    ngx_memcpy(node->key.data, key->data, key->len);
+    node->key.len = key->len;
+    node->timestamp = now;
+    node->count = 1;
+    node->terminal = 1;
+
+    return node;
+}
+
+static ngx_http_dmmr_rate_node_t *
+ngx_http_dmmr_rate_prune_node(ngx_http_request_t *r, ngx_http_dmmr_rate_node_t *node,
+                              ngx_msec_t now)
+{
+    if (node == NULL) {
+        return NULL;
+    }
+
+    if (node->terminal) {
+        if (now - node->timestamp > rate_window) {
+            ngx_free(node->key.data);
+            ngx_free(node);
+            return NULL;
+        }
+
+        return node;
+    }
+
+    node->child[0] = ngx_http_dmmr_rate_prune_node(r, node->child[0], now);
+    node->child[1] = ngx_http_dmmr_rate_prune_node(r, node->child[1], now);
+
+    if (node->child[0] == NULL && node->child[1] == NULL) {
+        ngx_free(node);
+        return NULL;
+    }
+
+    return node;
+}
+
+static ngx_http_dmmr_rate_node_t *
+ngx_http_dmmr_rate_insert_node(ngx_http_request_t *r, ngx_str_t *key,
+                               ngx_msec_t now, ngx_int_t *found)
+{
+    ngx_http_dmmr_rate_node_t *parent;
+    ngx_http_dmmr_rate_node_t *node;
+    ngx_http_dmmr_rate_node_t *new_leaf;
+    ngx_http_dmmr_rate_node_t *branch;
+    ngx_uint_t bit;
+    ngx_uint_t child_bit;
+
+    *found = 0;
+
+    if (rate_root == NULL) {
+        new_leaf = ngx_http_dmmr_rate_create_node(r, key, now);
+        if (new_leaf == NULL) {
+            return NULL;
+        }
+
+        rate_root = new_leaf;
+        return new_leaf;
+    }
+
+    parent = NULL;
+    node = rate_root;
+
+    while (node != NULL && node->terminal == 0) {
+        parent = node;
+        child_bit = ngx_http_dmmr_rate_bit_at(key, node->bit);
+        node = node->child[child_bit];
+    }
+
+    if (node != NULL && ngx_http_dmmr_rate_key_equal(&node->key, key)) {
+        *found = 1;
+        return node;
+    }
+
+    new_leaf = ngx_http_dmmr_rate_create_node(r, key, now);
+    if (new_leaf == NULL) {
+        return NULL;
+    }
+
+    if (node == NULL) {
+        if (parent == NULL) {
+            rate_root = new_leaf;
+            return new_leaf;
+        }
+
+        child_bit = ngx_http_dmmr_rate_bit_at(key, parent->bit);
+        parent->child[child_bit] = new_leaf;
+        return new_leaf;
+    }
+
+    branch = ngx_alloc(sizeof(ngx_http_dmmr_rate_node_t), r->connection->log);
+    if (branch == NULL) {
+        ngx_free(new_leaf->key.data);
+        ngx_free(new_leaf);
+        return NULL;
+    }
+
+    ngx_memzero(branch, sizeof(ngx_http_dmmr_rate_node_t));
+    branch->bit = ngx_http_dmmr_rate_first_diff_bit(key, &node->key);
+    branch->terminal = 0;
+
+    if (ngx_http_dmmr_rate_bit_at(key, branch->bit) == 0) {
+        branch->child[0] = new_leaf;
+        branch->child[1] = node;
+    } else {
+        branch->child[0] = node;
+        branch->child[1] = new_leaf;
+    }
+
+    if (parent == NULL) {
+        rate_root = branch;
+    } else {
+        child_bit = ngx_http_dmmr_rate_bit_at(key, parent->bit);
+        parent->child[child_bit] = branch;
+    }
+
+    return new_leaf;
 }
 
 ngx_int_t ngx_http_dmmr_rate_init(ngx_cycle_t *cycle)
 {
-    ngx_rbtree_init(&rate_tree, &rate_sentinel, ngx_rbtree_insert_value);
+    rate_root = NULL;
     return NGX_OK;
 }
 
@@ -45,9 +202,9 @@ ngx_int_t
 ngx_http_dmmr_rate_limit(ngx_http_request_t *r, ngx_http_dmmr_ctx_t *ctx)
 {
     ngx_str_t client_key;
-    ngx_http_dmmr_rate_node_t *node, *new_node;
-    ngx_rbtree_node_t *rb_node;
+    ngx_http_dmmr_rate_node_t *node;
     ngx_msec_t now;
+    ngx_int_t found;
     u_char buf[NGX_INET_ADDRSTRLEN];
 
     /* Cria chave = IP + período (minuto) */
@@ -60,68 +217,29 @@ ngx_http_dmmr_rate_limit(ngx_http_request_t *r, ngx_http_dmmr_ctx_t *ctx)
     }
 
     now = ngx_current_msec;
-    ngx_http_dmmr_rate_prune(rate_tree.root, now);
-    rb_node = rate_tree.root;
+    rate_root = ngx_http_dmmr_rate_prune_node(r, rate_root, now);
 
-    while (rb_node != &rate_sentinel && rb_node != NULL) {
-        node = (ngx_http_dmmr_rate_node_t *) rb_node;
-        
-        ngx_int_t cmp = ngx_strncmp(client_key.data, node->key.data,
-                                    client_key.len < node->key.len ? client_key.len : node->key.len);
-        if (cmp == 0) {
-            if (client_key.len < node->key.len) {
-                cmp = -1;
-            } else if (client_key.len > node->key.len) {
-                cmp = 1;
-            }
-        }
+    node = ngx_http_dmmr_rate_insert_node(r, &client_key, now, &found);
+    if (node == NULL) {
+        return NGX_HTTP_INTERNAL_SERVER_ERROR;
+    }
 
-        if (cmp == 0) {
-            /* Encontrou */
-            if (now - node->timestamp > rate_window) {
-                /* Reset */
-                node->count = 1;
-                node->timestamp = now;
-                return NGX_OK;
-            }
-            if (node->count >= rate_limit) {
-                ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
-                              "dmmr: rate limit exceeded for IP %V", &client_key);
-                return NGX_HTTP_TOO_MANY_REQUESTS;
-            }
-            node->count++;
+    if (found) {
+        if (now - node->timestamp > rate_window) {
+            node->count = 1;
+            node->timestamp = now;
             return NGX_OK;
         }
 
-        if (cmp < 0) {
-            rb_node = rb_node->left;
-        } else {
-            rb_node = rb_node->right;
+        if (node->count >= rate_limit) {
+            ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                          "dmmr: rate limit exceeded for IP %V", &client_key);
+            return NGX_HTTP_TOO_MANY_REQUESTS;
         }
-    }
 
-    /* Não encontrou: insere novo nó */
-    new_node = ngx_alloc(sizeof(ngx_http_dmmr_rate_node_t), r->connection->log);
-    if (new_node == NULL) {
-        return NGX_HTTP_INTERNAL_SERVER_ERROR;
+        node->count++;
+        return NGX_OK;
     }
-
-    new_node->key.data = ngx_alloc(client_key.len, r->connection->log);
-    if (new_node->key.data == NULL) {
-        ngx_free(new_node);
-        return NGX_HTTP_INTERNAL_SERVER_ERROR;
-    }
-    ngx_memcpy(new_node->key.data, client_key.data, client_key.len);
-    new_node->key.len = client_key.len;
-    new_node->count = 1;
-    new_node->timestamp = now;
-    new_node->node.key = (uintptr_t) new_node->key.data;
-    new_node->node.left = NULL;
-    new_node->node.right = NULL;
-    new_node->node.parent = NULL;
-    new_node->node.color = 1; /* RED */
-
-    ngx_rbtree_insert(&rate_tree, &new_node->node);
 
     return NGX_OK;
 }

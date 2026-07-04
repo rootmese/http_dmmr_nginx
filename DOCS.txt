@@ -1,0 +1,51 @@
+DMMR PROJECT - TECHNICAL NOTES
+=============================
+
+Repository structure:
+- nginx-dmmr-module-c/: Nginx module implemented in C
+- http_dmmr_cache/: local cache daemon backed by Berkeley DB
+
+Main components:
+1. Nginx module
+   - Handles auth, routing, rate limiting and proxying
+   - Reads the directive dmmr_cache_addr
+   - Uses the configured cache endpoint for lookups
+
+2. Cache daemon
+   - Exposes a small HTTP interface for key lookup/update/delete
+   - Supports Unix socket and TCP
+   - Persists data in Berkeley DB (apikeys.db)
+
+Cache address formats:
+- unix:/tmp/dmmr_cache.sock
+- tcp:127.0.0.1:9080
+
+Runtime behavior:
+- The Nginx module sends a request to the cache daemon when an API key is presented
+- The daemon returns 200 OK on success, or a failure status otherwise
+- The module falls back to static keys if the cache lookup does not succeed
+
+Build and run:
+- cd http_dmmr_cache
+- make
+- ./http_dmmr_cache --unix
+- ./http_dmmr_cache --tcp
+- ./http_dmmr_cache --both
+
+Example curl commands:
+- Unix socket:
+  curl --unix-socket /tmp/dmmr_cache.sock http://localhost/keys/abc123
+- TCP:
+  curl http://127.0.0.1:9080/keys/abc123
+
+Configuration example:
+location / {
+    dmmr_enable on;
+    dmmr_cache_addr unix:/tmp/dmmr_cache.sock;
+}
+
+Implementation notes:
+- Berkeley DB is used as the persistence layer
+- The module keeps a reusable connection to the cache daemon when possible
+- Socket failures are handled by closing the broken connection and reconnecting
+- The rate limiting logic uses an in-memory tree and should be evolved to shared memory for multi-worker environments

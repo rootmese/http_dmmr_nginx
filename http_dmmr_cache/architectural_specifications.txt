@@ -1,0 +1,351 @@
+DMMR CACHE PROTOCOL AND ARCHITECTURE SPECIFICATION
+===================================================
+
+Status of This Memo
+-------------------
+
+This document specifies the DMMR Cache System, a distributed
+in-memory cache with persistence and peer-to-peer replication.
+
+This specification is intended for implementation reference
+and internal system interoperability.
+
+It does not define an Internet standard.
+
+---
+
+1. Introduction
+---------------
+
+The DMMR Cache System is a distributed caching system providing:
+
+- Key-value storage with metadata
+- TTL-based expiration
+- Eventual consistency across nodes
+- Berkeley DB persistence
+- Custom binary protocol (DMMR Frame)
+- Legacy request compatibility
+
+The system is optimized for low-latency and high-throughput
+environments.
+
+---
+
+2. Conventions and Terminology
+------------------------------
+
+The key words "MUST", "MUST NOT", "REQUIRED", "SHALL",
+"SHALL NOT", "SHOULD", "SHOULD NOT", "RECOMMENDED",
+"MAY" are to be interpreted as described in RFC 2119.
+
+---
+
+3. System Overview
+------------------
+
+A DMMR node consists of the following components:
+
+- Network acceptor (select-based I/O multiplexer)
+- Worker thread pool
+- Job queue
+- Berkeley DB storage engine
+- TTL garbage collector
+- Cluster peer manager
+- Broadcast subsystem
+- Memory pool allocator system
+
+A node MAY operate in standalone mode or cluster mode.
+
+---
+
+4. Protocol Specification
+-------------------------
+
+4.1 Frame Format
+
+All modern requests MUST use the following binary frame:
+
+    struct dmmr_frame {
+        uint16_t magic;
+        uint16_t version;
+        uint16_t opcode;
+        uint16_t flags;
+        uint32_t key_len;
+        uint32_t value_len;
+        uint64_t timestamp;
+    }
+
+Fields MUST be transmitted in network byte order.
+
+---
+
+4.2 Supported Opcodes
+
+The following opcodes are defined:
+
+- OP_GET   (1): Retrieve value by key
+- OP_SET   (2): Insert or update value
+- OP_DEL   (3): Delete key
+- OP_SYNC  (4): Replication event from peer
+
+Unknown opcodes MUST be rejected.
+
+---
+
+4.3 Legacy Protocol
+
+If the first 4 bytes do not match (magic, version),
+the request MUST be treated as legacy.
+
+Legacy format:
+
+    uint16_t opcode
+    uint16_t key_len
+    uint8_t  payload[key_len]
+
+Only OP_GET is supported in legacy mode.
+
+---
+
+5. Storage Model
+-----------------
+
+5.1 Cache Entry
+
+Data stored in Berkeley DB MUST follow:
+
+    struct cache_entry {
+        uint64_t timestamp;
+        uint64_t node_id;
+        uint32_t value_len;
+        uint64_t expire_at;
+    }
+
+The value MUST be stored immediately after the header.
+
+---
+
+5.2 Conflict Resolution
+
+If a key already exists, the system MUST apply:
+
+1. Higher timestamp wins
+2. If timestamps are equal, higher node_id wins
+3. Otherwise, the update MUST be ignored
+
+---
+
+6. Network Model
+----------------
+
+6.1 Connection Handling
+
+Incoming connections:
+
+- MUST be accepted via select()
+- MUST be dispatched to worker queue
+- MUST be processed by worker threads
+- SHOULD be closed after request completion
+
+---
+
+6.2 Worker Processing
+
+A worker MUST:
+
+1. Read frame from socket
+2. Decode protocol
+3. Execute operation
+4. Return response
+5. Release allocated buffers
+
+Workers MUST NOT perform blocking cluster operations.
+
+---
+
+7. Memory Management
+--------------------
+
+The system MUST NOT use malloc/free in request hot path
+except during initialization or controlled pool expansion.
+
+The following pools exist:
+
+- payload_buf pool
+- job_fd_entry pool
+- control_cmd pool
+- delete_entry pool
+
+Pools MUST:
+
+- Provide reuse of fixed structures
+- Use mutex protection
+- Expand dynamically when required
+
+---
+
+8. Cluster Model
+----------------
+
+8.1 Peer Definition
+
+A peer is defined as:
+
+    struct peer {
+        char addr[64];
+        int port;
+        int sock;
+    }
+
+Peers MUST maintain persistent TCP connections when possible.
+
+---
+
+8.2 Replication
+
+Writes MAY be replicated using OP_SYNC frames.
+
+Replication MUST:
+
+- Be sent to all active peers
+- Use persistent connections when available
+- Attempt reconnection on failure
+
+Replication is eventual-consistent.
+
+---
+
+9. TTL and Garbage Collection
+-----------------------------
+
+9.1 TTL Scan
+
+The system MUST perform incremental TTL scanning using:
+
+- Persistent Berkeley DB cursor
+- Fixed chunk size scans
+
+Expired entries MUST be queued for deletion.
+
+---
+
+9.2 GC Processing
+
+Garbage collector MUST:
+
+1. Remove expired entries from DB
+2. Trigger deletion broadcast
+3. Free associated pool entries
+
+GC MUST operate asynchronously.
+
+---
+
+10. Concurrency Model
+---------------------
+
+The system uses multiple independent lock domains:
+
+- peer_mutex
+- queue_mutex
+- control_mutex
+- gc_mutex
+- per-pool mutexes
+
+Global locking MUST be avoided in request path.
+
+---
+
+11. Request Processing
+----------------------
+
+11.1 Write Path (OP_SET)
+
+1. Receive request
+2. Store value in DB
+3. Enqueue broadcast event
+4. Return response
+
+---
+
+11.2 Read Path (OP_GET)
+
+1. Receive request
+2. Query DB
+3. Return value or error code
+
+---
+
+11.3 Delete Path (OP_DEL)
+
+1. Remove from DB
+2. Enqueue deletion broadcast
+3. Return response
+
+---
+
+12. Control and Background Tasks
+--------------------------------
+
+The system contains background threads:
+
+- Control thread (orchestration + TTL scan trigger)
+- Broadcast worker threads
+- Garbage collector thread
+
+Background tasks MUST NOT block request processing.
+
+---
+
+13. Failure Handling
+--------------------
+
+- Broken peer connections MUST be closed and retried
+- DB_NOTFOUND MUST map to NOT_FOUND response
+- Partial send/recv MUST result in connection termination
+- Pool exhaustion MAY reject requests
+
+---
+
+14. Security Considerations
+---------------------------
+
+This system does not implement authentication or encryption
+at the protocol level.
+
+Deployment environments SHOULD use network isolation or TLS
+termination externally.
+
+---
+
+15. Performance Considerations
+------------------------------
+
+The system is designed with:
+
+- Zero allocation request path
+- Fixed-size buffers
+- Lock domain isolation
+- Incremental GC scanning
+- Persistent peer connections
+
+Contention MAY occur in shared pool mutexes.
+
+---
+
+16. IANA Considerations
+-----------------------
+
+This document defines no IANA registries.
+
+---
+
+17. References
+--------------
+
+[RFC2119] Key words for use in RFCs
+[BerkeleyDB] Oracle Berkeley DB Documentation
+
+---
+
+End of Document

@@ -15,7 +15,6 @@
 #include <pthread.h>
 #include <sys/socket.h>
 #include <sys/un.h>
-#include <poll.h>
 #include <arpa/inet.h>
 #include <netinet/tcp.h>
 #include <sys/queue.h>
@@ -884,20 +883,6 @@ int main(int argc, char *argv[]) {
     }
     /* Thread do Garbage Collector */
     pthread_create(&gc_thread, NULL, gc_worker_routine, NULL);
-
-    /* ============================================================
-     * (C) Loop principal de accept – migrado para poll()
-     * ============================================================ */
-    struct pollfd pollfds[2];
-    nfds_t nfds = 0;
-    for (int i = 0; i < listen_count; i++) {
-        if (listen_fds[i] >= 0) {
-            pollfds[nfds].fd = listen_fds[i];
-            pollfds[nfds].events = POLLIN;
-            pollfds[nfds].revents = 0;
-            nfds++;
-        }
-    }
 
 /* ============================================================
  * (C) Loop principal de accept – usando select() (POSIX)

@@ -141,6 +141,63 @@ Any observability feature requires changes in both:
 
 ---
 
+## 2.6 Server Runtime Architecture
+
+Refactor the server bootstrap and listener loop into independent runtime components.
+
+### Goals
+
+- Separate server initialization from runtime management.
+- Keep protocol, cache and worker logic independent from execution mode.
+- Preserve POSIX portability as the default implementation.
+- Prepare the project for multiple deployment models without changing the core server logic.
+
+### Planned architecture
+
+Core server:
+
+- server_main()
+  - initialize pools
+  - initialize Berkeley DB
+  - start worker threads
+  - start control threads
+  - create listening sockets
+  - execute listener loop
+  - perform graceful shutdown
+
+Runtime layer:
+
+- foreground mode
+- daemon mode (Unix double-fork)
+- container mode (foreground process managed by Docker, systemd or Supervisor)
+
+### Listener abstraction
+
+Encapsulate the connection acceptance loop behind a dedicated interface.
+
+Default implementation:
+
+- POSIX `select()`
+
+Platform-specific implementations may be provided through conditional compilation (`#ifdef`) while preserving the same public interface.
+
+Examples include:
+
+- `kqueue` on BSD systems
+- `epoll` on Linux systems
+
+The server core must remain independent of the underlying event notification mechanism.
+
+### Benefits
+
+- Cleaner `main()`
+- Better separation between runtime and server logic
+- Improved POSIX portability
+- Easier platform-specific optimization
+- Simpler long-term maintenance
+
+---
+
 # 3. Security Hardening
 
 - Remove hardcoded API keys from source code

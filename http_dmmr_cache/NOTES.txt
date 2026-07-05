@@ -1,0 +1,304 @@
+GARGALOS SILENCIOSOS – OS "MATADORES" DE DESEMPENHO
+-------------------------------------------------------------------------------
+
+a) Varredura de TTL (scan_expired_entries) – O MAIOR VILÃO
+----------------------------------------------------------
+ATUAL:
+A thread de controle executa a cada 5 segundos um scan completo do banco
+(cursor do Berkeley DB) para remover chaves expiradas. Em um DB com
+1 milhão de chaves, essa varredura pode levar de 0,5 a 2 segundos,
+travando completamente o banco (locks internos) e zerando a vazão
+durante esse período.
+
+EFEITO:
+A vazão sustentada despenca, tornando o servidor praticamente
+inutilizável para cargas reais com muitos dados.
+
+SOLUÇÃO PROPOSTA (Divisão Temporal com Cursor Persistente):
+
+- Manter um cursor (DBC) persistente durante toda a vida do processo.
+- O cursor NÃO deve ser recriado a cada execução da rotina de limpeza.
+- A cada 5 segundos, percorrer apenas um chunk do banco (ex.: 100 chaves ou 10ms de processamento).
+- Para cada registro expirado encontrado, apenas marcar o registro como elegível para exclusão (delete_pending ou equivalente).
+- A rotina de varredura NÃO deve realizar exclusões físicas do banco.
+- Ao atingir o final do banco, reposicionar explicitamente o cursor utilizando DB_FIRST e continuar a varredura a partir do início.
+- A varredura deve ser contínua e circular, distribuindo o trabalho ao longo do tempo.
+- Uma segunda thread (Flush Worker / Garbage Collector) será responsável por percorrer os registros marcados e executar a exclusão física de forma assíncrona, desacoplando o custo de I/O da rotina de varredura de TTL.
+
+IMPLEMENTAÇÃO SUGERIDA:
+- Substituir a implementação atual de scan_expired_entries().
+- Manter um DBC *cursorp global protegido por mutex.
+- Avançar utilizando DB_NEXT.
+- Ao receber DB_NOTFOUND (fim do banco), reposicionar o cursor utilizando DB_FIRST.
+
+OBSERVAÇÃO DE PROJETO:
+
+A thread responsável pela varredura de TTL deve executar apenas operações leves
+de leitura e marcação dos registros expirados. Toda operação que envolva I/O de
+remoção deverá ser executada exclusivamente pela thread de Flush/Garbage Collector,
+mantendo o tempo de execução da varredura previsível e constante.
+
+b) Alocação de Memória Excessiva
+   ------------------------------
+   ATUAL:
+   Cada requisição acarreta múltiplas alocações dinâmicas:
+   - `read_frame()`: malloc para o payload (key+value).
+   - `db_get_with_meta()`: malloc para o valor retornado.
+   - `db_set_with_meta()`: malloc para montar o registro (cache_entry + value).
+   - Broadcast: malloc do `control_cmd` (copia chave e valor).
+   Com 15.000 req/s, temos > 60.000 chamadas malloc/free por segundo, 
+   causando fragmentação, contenção no heap e overhead considerável.
+
+   SOLUÇÃO PROPOSTA (metodologia de pools):
+   - Pré-alocar arrays contíguos de estruturas (ex.: pool de buffers para 
+     payloads, pool para `control_cmd`) com tamanho inicial adequado.
+   - Cada entrada do pool possui um flag (ex.: `fd` ou `run`) que indica 
+     se está em uso. Funções `get_*` percorrem o array linearmente em 
+     busca da primeira entrada livre (cache‑friendly e baixo overhead).
+   - Quando o pool atinge a capacidade, o tamanho é dobrado com `realloc` 
+     (operação rara, não impacta a performance média).
+   - Mutexes específicos por pool protegem o acesso concorrente, 
+     reduzindo a contenção em relação ao alocador global.
+   - O gerenciamento manual elimina chamadas `malloc`/`free` por 
+     requisição, mantendo a localidade de cache, eliminando fragmentação 
+     e reduzindo drasticamente o overhead de alocação.
+
+c) select() com limite de 1024 descritores
+   ---------------------------------------
+   ATUAL (CORREÇÃO IMPORTANTE):
+   O `main()` usa `select()` apenas para monitorar os sockets de 
+   escuta (Unix e TCP), que são no máximo 2. Portanto, o limite de 
+   1024 do `select()` **NÃO** é um gargalo para este código, pois 
+   os descritores dos clientes são entregues às threads e não são 
+   monitorados pelo loop principal.
+
+   Contudo, se no futuro o servidor for modificado para monitorar 
+   múltiplas conexões ativas (ex.: manter conexões persistentes), 
+   o `select()` se tornará um limitador.
+
+   SOLUÇÃO PREVENTIVA:
+   - Migre o loop principal para `poll()` ou `epoll()` (Linux) para 
+     eliminar o limite de 1024 e melhorar a escalabilidade para 
+     dezenas de milhares de conexões simultâneas.
+   - Se mesmo assim desejar aumentar o `FD_SETSIZE`, é necessário 
+     recompilar com `-DFD_SETSIZE=4096` (não recomendado para 
+     valores muito altos e não suportado oficialmente pela glibc).
+
+   OBSERVAÇÃO SOBRE O SO:
+   - O limite de arquivos abertos do sistema (ulimit -n) NÃO afeta 
+     o `select()`; ele controla quantos descritores um processo pode 
+     abrir. Para este servidor, `ulimit -n 65535` é seguro, mas não 
+     resolve o `FD_SETSIZE` do `select()`.
+
+d) Broadcast Síncrono e Bloqueante
+   --------------------------------
+   ATUAL:
+   Os workers de broadcast (ativados quando a fila de controle supera 
+   `HIGH_WATERMARK=50`) executam cada `CMD_BROADCAST` de forma 
+   sequencial para todos os peers:
+      socket() → connect() → send() → close()
+   Se houver 3 peers com RTT=1ms, cada broadcast leva ~3ms, reduzindo 
+   a capacidade de replicação para ~333 broadcasts/segundo por worker.
+   Em picos de SET, a fila de controle cresce rapidamente e pode 
+   consumir memória indefinidamente.
+
+   SOLUÇÃO PROPOSTA:
+   - Mantenha conexões persistentes (keep-alive) com cada peer, 
+     evitando o handshake TCP a cada mensagem.
+   - Crie um pool de conexões (uma fila de envio por peer) e uma 
+     thread dedicada para drenar cada fila de forma assíncrona, 
+     usando `send()` não-bloqueante ou `epoll`.
+   - Com isso, o custo por broadcast cai para apenas o tempo de 
+     envio do frame (microssegundos), eliminando o gargalo de rede.
+
+TUTORIAL: COMO AMPLIAR O LIMITE DE DESCRITORES (ulimit e FD_SETSIZE)
+-------------------------------------------------------------------------------
+Apesar de não ser necessário para o `select()` atual, para completude:
+
+- **Aumentar limite do sistema (soft/hard)**:
+ulimit -n 65535
+
+Isso permite que o processo abra muitos arquivos/sockets, mas não afeta 
+o `FD_SETSIZE` do `select()`.
+
+- **Aumentar FD_SETSIZE no código**:
+- Defina `-DFD_SETSIZE=4096` na compilação (ex.: no Makefile, adicione 
+  `CFLAGS += -DFD_SETSIZE=4096`).
+- Isso exige que o programa seja recompilado e pode não funcionar 
+  com valores muito altos (a glibc pode ignorar ou causar comportamento 
+  indefinido).
+
+- **Alternativa recomendada**:
+Substitua `select()` por `poll()` ou `epoll()` para eliminar 
+completamente essa limitação.
+
+TUTORIAL: Implementação de Pool de Objetos para Eliminar 
+                 Alocações Dinâmicas Excessivas
+-------------------------------------------------------------------------------
+
+1. INTRODUÇÃO
+-------------------------------------------------------------------------------
+Em sistemas de alta performance, chamadas frequentes a malloc() e free() 
+são um dos maiores vilões da latência e vazão. Cada alocação envolve:
+- Busca por um bloco livre no heap (O(n) no pior caso).
+- Contenção no lock global do alocador (em sistemas multi-thread).
+- Fragmentação da memória, prejudicando a localidade de cache.
+
+A solução clássica é implementar um **pool de objetos** (também chamado de 
+slab allocator ou object cache). Em vez de alocar e liberar dinamicamente 
+a cada requisição, pré-alocamos um grande bloco de estruturas e as 
+reutilizamos, marcando cada entrada como "livre" ou "ocupada".
+
+Este tutorial ensina, passo a passo, como implementar essa técnica no 
+servidor DMMR Cache, com base na metodologia já utilizada pelo 
+desenvolvedor para pools de `struct node` e `struct tcp_node`.
+
+2. CONCEITOS FUNDAMENTAIS
+-------------------------------------------------------------------------------
+Um pool de objetos é caracterizado por:
+
+- Array contíguo de estruturas: todas as instâncias ficam em um único 
+  bloco de memória, garantindo localidade de cache e acesso rápido.
+- Flag de uso: cada entrada possui um campo (ex.: `int fd` ou `int run`) 
+  que, quando zero, indica que a entrada está livre.
+- Função de aquisição (`get_*`): percorre o array linearmente em busca 
+  da primeira entrada com flag zero. Se encontrar, marca como ocupada e 
+  retorna o ponteiro.
+- Função de liberação (`delete_*` ou `release_*`): zera a entrada ou 
+  apenas reseta a flag para zero, devolvendo-a ao pool.
+- Redimensionamento automático: quando o pool está cheio, dobra-se o 
+  tamanho com `realloc()` (operação rara, que não afeta a performance média).
+- Proteção por mutex: um mutex específico para o pool garante acesso 
+  concorrente seguro, evitando contenção no alocador global.
+
+3. IMPLEMENTAÇÃO BÁSICA – O MODELO DO DESENVOLVEDOR
+-------------------------------------------------------------------------------
+O código já apresentado para `struct node` e `struct tcp_node` serve como 
+template perfeito. Vamos reproduzi-lo aqui com comentários didáticos.
+
+3.1. Estruturas e variáveis globais
+
+// Pool de struct node
+static struct node *node_pool = NULL;
+static unsigned node_pool_size = 0;    // capacidade atual
+static unsigned node_pool_count = 0;   // quantas entradas já foram alocadas (máximo usado)
+static pthread_mutex_t node_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+// Pool de struct tcp_node (similar)
+static struct tcp_node *tcp_pool = NULL;
+static unsigned tcp_pool_size = 0;
+static unsigned tcp_pool_count = 0;
+static pthread_mutex_t tcp_node_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+3.2. Função de aquisição (get_node)
+
+static struct node *get_node(void) {
+    struct node *p = node_pool;
+    struct node *p1 = node_pool + node_pool_size;
+
+    pthread_mutex_lock(&node_mutex);
+
+    // Busca linear pela primeira entrada livre (fd == 0)
+    for (; p < p1; ++p) {
+        if (p->fd == 0) {
+            pthread_mutex_unlock(&node_mutex);
+            return p;   // entrada livre encontrada
+        }
+    }
+
+    // Se chegou aqui, o pool está cheio. Redimensiona (dobra o tamanho)
+    if (node_pool_count >= node_pool_size) {
+        node_pool_size = (node_pool_size == 0) ? 1 : (node_pool_size * 2);
+        node_pool = realloc(node_pool, node_pool_size * sizeof(struct node));
+        if (!node_pool) {
+            pthread_mutex_unlock(&node_mutex);
+            return NULL;   // erro
+        }
+    }
+
+    // Pega a próxima entrada não utilizada (node_pool_count)
+    struct node *ret = node_pool + node_pool_count++;
+    pthread_mutex_unlock(&node_mutex);
+    return ret;
+}
+Observações importantes:
+
+A busca linear é eficiente porque o array é pequeno e mantido em cache.
+
+O redimensionamento com realloc() só ocorre quando todas as entradas
+estão ocupadas e a contagem atual já atingiu a capacidade.
+
+O mutex protege todo o acesso, garantindo que dois threads não obtenham
+a mesma entrada.
+
+3.3. Função de liberação (delete_node)
+
+static void delete_node(struct node *p) {
+    if (p) {
+        pthread_mutex_lock(&node_mutex);
+        memset(p, 0, sizeof(struct node));   // zera completamente a entrada
+        pthread_mutex_unlock(&node_mutex);
+    }
+}
+Observação: Em vez de memset, poderíamos apenas resetar o flag fd = 0,
+deixando os outros campos intactos (mas é seguro zerar tudo). O importante é
+que a entrada fique marcada como livre.
+
+3.4. Inicialização e finalização dos pools
+
+int init_pools(void) {
+    // Tamanho inicial: 1024 entradas (0x400)
+    node_pool = calloc(0x400, sizeof(struct node));
+    if (!node_pool) return -1;
+    node_pool_size = 0x400;
+    node_pool_count = 0;   // nenhuma entrada foi usada ainda
+
+    tcp_pool = calloc(0x400, sizeof(struct tcp_node));
+    if (!tcp_pool) {
+        free(node_pool);
+        return -1;
+    }
+    tcp_pool_size = 0x400;
+    tcp_pool_count = 0;
+
+    pthread_mutex_init(&node_mutex, NULL);
+    pthread_mutex_init(&tcp_node_mutex, NULL);
+    return 0;
+}
+
+void destroy_pools(void) {
+    free(node_pool);
+    free(tcp_pool);
+    pthread_mutex_destroy(&node_mutex);
+    pthread_mutex_destroy(&tcp_node_mutex);
+}
+
+3.5 ONDE APLICAR ESTA METODOLOGIA
+
+A técnica de pools é universal e pode ser aplicada a qualquer estrutura de dados que seja frequentemente alocada e liberada durante a execução do programa. Exemplos típicos:
+
+- Buffers de rede (leitura/escrita de pacotes).
+- Estruturas de controle de conexões (como struct node e struct tcp_node no exemplo).
+- Comandos ou mensagens que são enfileirados para processamento assíncrono.
+- Registros temporários montados para gravação em banco de dados.
+- Qualquer objeto cujo ciclo de vida seja curto e de alta frequência.
+- Para cada tipo de estrutura, basta replicar o padrão apresentado nas seções 3.1,, 3.2 e 3.3:
+
+Defina um array global com um flag de uso.
+
+- Crie funções get_* e release_* com a mesma lógica de busca linear e redimensionamento.
+- Proteja o acesso com um mutex específico para aquele pool.
+- Substitua as chamadas malloc/free pelas funções do pool.
+
+DETALHES FINOS E BOAS PRÁTICAS
+
+Tamanho inicial dos pools: Escolha um valor que cubra o pico esperado de uso simultâneo. O redimensionamento automático garante que não haja falta.
+
+Evite manter ponteiros para entradas do pool por longos períodos: O redimensionamento com realloc pode mover o array, invalidando ponteiros antigos. Se precisar armazenar um ponteiro por mais tempo, prefira armazenar um índice (offset) e recuperar a entrada via pool + index.
+
+Mutex por pool: Cada pool tem seu próprio mutex, reduzindo contenção. Em sistemas com muitas threads.
+
+Limpeza dos dados: Ao liberar uma entrada, não é necessário zerar todos os campos (exceto o flag de uso), pois a próxima aquisição sobrescreverá os dados. Mas zerar tudo é uma prática segura para evitar
+
+
+

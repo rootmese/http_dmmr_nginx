@@ -20,7 +20,7 @@ The system is currently considered EXPERIMENTAL and may contain instability in:
 
 
 ################################################################################
-#  ALPHA STATUS JUSTIFICATION
+##  ALPHA STATUS JUSTIFICATION
 ################################################################################
 
 Version 0.0.2-alpha reflects a deliberate decision to mark the system as
@@ -44,7 +44,7 @@ Until these validations are complete, the project remains in ALPHA stage.
 
 
 ################################################################################
-# PROJECT OVERVIEW
+## PROJECT OVERVIEW
 ################################################################################
 
 This repository contains a lightweight, high-performance API gateway
@@ -63,7 +63,7 @@ implementation in C, composed of:
 
 
 ################################################################################
-# REPOSITORY STRUCTURE
+## REPOSITORY STRUCTURE
 ################################################################################
 
 - nginx-dmmr-module-c/
@@ -74,7 +74,7 @@ implementation in C, composed of:
 
 
 ################################################################################
-# 1. CACHE SERVICE (http_dmmr_cache)
+## 1. CACHE SERVICE (http_dmmr_cache)
 ################################################################################
 
 The cache service stores keys persistently in:
@@ -83,7 +83,7 @@ http_dmmr_cache/apikeys.db
 
 
 --------------------------------------------------------------------------------
-# DEPENDENCIES
+### DEPENDENCIES
 --------------------------------------------------------------------------------
 
 Debian/Ubuntu:
@@ -94,7 +94,7 @@ sudo dnf install libmicrohttpd-devel libdb-dev
 
 
 --------------------------------------------------------------------------------
-# BUILD AND RUN
+### BUILD AND RUN
 --------------------------------------------------------------------------------
 
 cd http_dmmr_cache
@@ -114,7 +114,7 @@ By default, the service listens on:
 
 
 --------------------------------------------------------------------------------
-# KEY MANAGEMENT EXAMPLES (curl)
+### KEY MANAGEMENT EXAMPLES (curl)
 --------------------------------------------------------------------------------
 
 Insert or update a key (Unix socket):
@@ -142,7 +142,7 @@ curl http://127.0.0.1:9080/keys/abc123
 
 
 ################################################################################
-# 2. NGINX MODULE (nginx-dmmr-module-c)
+## 2. NGINX MODULE (nginx-dmmr-module-c)
 ################################################################################
 
 This module intercepts HTTP requests during the access phase to:
@@ -153,7 +153,7 @@ This module intercepts HTTP requests during the access phase to:
 
 
 --------------------------------------------------------------------------------
-# BUILD NGINX WITH MODULE
+### BUILD NGINX WITH MODULE
 --------------------------------------------------------------------------------
 
 wget http://nginx.org/download/nginx-1.24.0.tar.gz
@@ -166,7 +166,7 @@ sudo make install
 
 
 --------------------------------------------------------------------------------
-# EXAMPLE CONFIGURATION (nginx.conf)
+### EXAMPLE CONFIGURATION (nginx.conf)
 --------------------------------------------------------------------------------
 
 load_module /usr/local/nginx/modules/ngx_http_dmmr_module.so;
@@ -207,7 +207,7 @@ http {
 
 
 ################################################################################
-# AUTHENTICATION FLOW
+### AUTHENTICATION FLOW
 ################################################################################
 
 Request arrives with credentials via:
@@ -240,7 +240,7 @@ Rate limiting is applied using:
 
 
 ################################################################################
-# FUTURE WORK AND ROADMAP
+## FUTURE WORK AND ROADMAP
 ################################################################################
 
 A structured roadmap is available in:
@@ -258,7 +258,7 @@ It includes planned improvements for:
 
 
 ################################################################################
-# LICENSE
+## LICENSE
 ################################################################################
 
 This project is licensed under the BSD 2-Clause License.

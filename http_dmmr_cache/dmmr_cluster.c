@@ -2,6 +2,7 @@
 #include "dmmr_config.h"
 #include "dmmr_protocol.h"
 #include "dmmr_net.h"
+#include "dmmr_pool.h"
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -12,6 +13,7 @@
 #include <string.h>
 #include <unistd.h>
 #include <errno.h>
+#include <signal.h>
 #include <sys/queue.h>
 
 extern uint64_t my_node_id;
@@ -21,9 +23,13 @@ extern int process_frame(int fd, struct dmmr_frame *frame, const uint8_t *payloa
 extern int read_frame(int fd, struct dmmr_frame *frame, uint8_t **payload,
                       bool *is_legacy, uint16_t *legacy_opcode, uint16_t *legacy_key_len);
 
+/* ============================================================
+ * (D) Peers com conexões persistentes
+ * ============================================================ */
 struct peer {
     char addr[64];
     int port;
+    int sock;    /* conexão persistente (-1 = desconectado) */
     TAILQ_ENTRY(peer) entries;
 };
 TAILQ_HEAD(peer_list, peer) peers_head;
@@ -39,9 +45,63 @@ void add_peer(const char *addr, int port) {
     strncpy(p->addr, addr, sizeof(p->addr)-1);
     p->addr[sizeof(p->addr)-1] = '\0';
     p->port = port;
+    p->sock = -1;  /* será conectado no primeiro uso */
     pthread_mutex_lock(&peers_mutex);
     TAILQ_INSERT_TAIL(&peers_head, p, entries);
     pthread_mutex_unlock(&peers_mutex);
+}
+
+/* ============================================================
+ * Conexão persistente: conecta ou reutiliza socket existente
+ * ============================================================ */
+static int peer_connect(struct peer *p) {
+    /* Se já conectado, verifica se a conexão ainda é válida */
+    if (p->sock >= 0) {
+        /* Teste rápido: tenta peek sem bloquear */
+        char test;
+        ssize_t rc = recv(p->sock, &test, 1, MSG_PEEK | MSG_DONTWAIT);
+        if (rc == 0) {
+            /* Peer fechou a conexão */
+            close(p->sock);
+            p->sock = -1;
+        } else if (rc < 0 && errno != EAGAIN && errno != EWOULDBLOCK) {
+            /* Erro na conexão */
+            close(p->sock);
+            p->sock = -1;
+        }
+        /* Se rc == -1 com EAGAIN/EWOULDBLOCK, a conexão está ok (sem dados) */
+    }
+
+    if (p->sock >= 0) {
+        return p->sock;  /* conexão reutilizada */
+    }
+
+    /* Criar nova conexão */
+    int sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (sock < 0) return -1;
+
+    int opt = 1;
+    setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt));
+
+    /* Manter a conexão viva */
+    setsockopt(sock, SOL_SOCKET, SO_KEEPALIVE, &opt, sizeof(opt));
+
+    struct sockaddr_in addr;
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(p->port);
+    if (inet_pton(AF_INET, p->addr, &addr.sin_addr) <= 0) {
+        close(sock);
+        return -1;
+    }
+
+    if (connect(sock, (struct sockaddr *)&addr, sizeof(addr)) != 0) {
+        close(sock);
+        return -1;
+    }
+
+    p->sock = sock;
+    return sock;
 }
 
 void broadcast_sync(const char *key, size_t key_len,
@@ -68,27 +128,45 @@ void broadcast_sync(const char *key, size_t key_len,
     pthread_mutex_lock(&peers_mutex);
     struct peer *p;
     TAILQ_FOREACH(p, &peers_head, entries) {
-        int sock = socket(AF_INET, SOCK_STREAM, 0);
+        int sock = peer_connect(p);
         if (sock < 0) continue;
-        int opt = 1;
-        setsockopt(sock, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt));
 
-        struct sockaddr_in addr;
-        memset(&addr, 0, sizeof(addr));
-        addr.sin_family = AF_INET;
-        addr.sin_port = htons(p->port);
-        if (inet_pton(AF_INET, p->addr, &addr.sin_addr) <= 0) {
-            close(sock);
-            continue;
+        /* Tenta enviar; se falhar, fecha e tenta reconectar uma vez */
+        ssize_t r1 = send_full(sock, &frame, sizeof(frame), 0);
+        if (r1 != (ssize_t)sizeof(frame)) {
+            close(p->sock);
+            p->sock = -1;
+            sock = peer_connect(p);
+            if (sock < 0) continue;
+            if (send_full(sock, &frame, sizeof(frame), 0) != (ssize_t)sizeof(frame)) {
+                close(p->sock);
+                p->sock = -1;
+                continue;
+            }
         }
-        if (connect(sock, (struct sockaddr *)&addr, sizeof(addr)) == 0) {
-            send_full(sock, &frame, sizeof(frame), 0);
-            send_full(sock, payload, total_payload, 0);
+        if (send_full(sock, payload, total_payload, 0) != (ssize_t)total_payload) {
+            close(p->sock);
+            p->sock = -1;
         }
-        close(sock);
+        /* NÃO fecha o socket: conexão persistente */
     }
     pthread_mutex_unlock(&peers_mutex);
     free(payload);
+}
+
+/* ============================================================
+ * Fechar todas as conexões persistentes (chamado no shutdown)
+ * ============================================================ */
+void close_peer_connections(void) {
+    pthread_mutex_lock(&peers_mutex);
+    struct peer *p;
+    TAILQ_FOREACH(p, &peers_head, entries) {
+        if (p->sock >= 0) {
+            close(p->sock);
+            p->sock = -1;
+        }
+    }
+    pthread_mutex_unlock(&peers_mutex);
 }
 
 void *cluster_listener(void *arg) {
@@ -140,7 +218,12 @@ void *cluster_listener(void *arg) {
             local_frame.flags = htons(FLAG_FROM_PEER);
             process_frame(peer_fd, &local_frame, payload, source_node_id, true);
         }
-        if (payload) free(payload);
+        if (payload) {
+            /* Payload vem do pool agora – liberar via container_of */
+            struct payload_buf *pbuf = (struct payload_buf *)
+                ((uint8_t *)payload - __builtin_offsetof(struct payload_buf, data));
+            release_payload_buf(pbuf);
+        }
         close(peer_fd);
     }
 

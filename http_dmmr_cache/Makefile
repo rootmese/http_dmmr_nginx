@@ -3,7 +3,7 @@ CFLAGS = -Wall -Wextra -O2 -pthread
 LDFLAGS = -ldb -lpthread
 
 TARGET = dmmr_cache
-OBJS = dmmr_net.o dmmr_db.o dmmr_cluster.o dmmr_server.o
+OBJS = dmmr_net.o dmmr_db.o dmmr_cluster.o dmmr_pool.o dmmr_server.o
 
 all: $(TARGET)
 

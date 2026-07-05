@@ -23,4 +23,8 @@
 #define LOW_WATERMARK   10   // desativa quando cair abaixo
 #define BROADCAST_WORKERS 2  // número máximo de workers auxiliares
 
+#define TTL_SCAN_CHUNK_SIZE 100   // chaves por ciclo de varredura de TTL
+#define GC_FLUSH_INTERVAL_MS 100  // intervalo do garbage collector (ms)
+#define POOL_INITIAL_SIZE 0x400   // tamanho inicial dos pools (1024 entradas)
+
 #endif /* DMMR_CONFIG_H */

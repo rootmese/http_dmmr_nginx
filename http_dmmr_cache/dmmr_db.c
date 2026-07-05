@@ -31,7 +31,7 @@ void close_db(void) {
 int db_get_with_meta(const char *key, size_t key_len,
                      uint64_t *ts_out, uint64_t *node_id_out,
                      void **value_out, size_t *value_len_out,
-                     uint64_t expire_at_out) {
+                     uint64_t *expire_at_out) {
     DBT key_dbt, data_dbt;
     memset(&key_dbt, 0, sizeof(key_dbt));
     memset(&data_dbt, 0, sizeof(data_dbt));
@@ -51,7 +51,8 @@ int db_get_with_meta(const char *key, size_t key_len,
     *ts_out = entry->timestamp;
     *node_id_out = entry->node_id;
     *value_len_out = entry->value_len;
-    *expire_at_out = entry->expire_at;
+    if (expire_at_out)
+        *expire_at_out = entry->expire_at;
 
     if (value_out != NULL) {
         *value_out = malloc(entry->value_len);

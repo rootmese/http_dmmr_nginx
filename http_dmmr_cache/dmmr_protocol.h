@@ -2,7 +2,10 @@
 #define DMMR_PROTOCOL_H
 
 #include <stdint.h>
+#include <stddef.h>
 #include <stdbool.h>
+#include <sys/queue.h>
+#include "dmmr_config.h"
 
 /* Opcodes e flags */
 enum dmmr_opcode {

@@ -13,7 +13,7 @@ int db_get_with_meta(const char *key, size_t key_len,
 
 int db_set_with_meta(const char *key, size_t key_len,
                      uint64_t ts, uint64_t node_id,
-                     const void *value, size_t value_len);
+                     const void *value, size_t value_len, uint64_t expire_at);
 
 int db_del_key(const char *key, size_t key_len);
 

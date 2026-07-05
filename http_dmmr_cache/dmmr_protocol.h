@@ -30,9 +30,10 @@ struct dmmr_frame {
 
 /* Metadados armazenados com o valor no DB */
 struct cache_entry {
-    uint64_t timestamp;
-    uint64_t node_id;
+    uint64_t timestamp;   // usado para resolução de conflitos de sincronia
+    uint64_t node_id;     // origem do dado
     uint32_t value_len;
+    uint64_t expire_at;   // timestamp em microssegundos quando o registro expira
 };
 
 /* Funções de conversão 64-bit */
@@ -45,5 +46,23 @@ static inline uint64_t htonll(uint64_t value) {
 static inline uint64_t ntohll(uint64_t value) {
     return htonll(value);
 }
+
+enum control_cmd_type {
+    CMD_BROADCAST,
+    CMD_SHUTDOWN,
+    /* futuros: CMD_TTL_SCAN, CMD_STATS, etc. */
+};
+
+struct control_cmd {
+    enum control_cmd_type type;
+    uint64_t ts;          // timestamp do evento (para broadcast)
+    uint64_t node_id;     // nó origem
+    char key[MAX_KEY_LEN];
+    size_t key_len;
+    uint8_t *value;       // pode ser NULL (para DEL)
+    size_t value_len;
+    TAILQ_ENTRY(control_cmd) entries;
+};
+TAILQ_HEAD(control_queue, control_cmd);
 
 #endif /* DMMR_PROTOCOL_H */

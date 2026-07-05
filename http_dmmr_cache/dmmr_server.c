@@ -19,6 +19,16 @@
 #include <sys/queue.h>
 #include <time.h>
 
+#define TTL_DEFAULT (3600ULL * 1000000ULL)
+
+pthread_mutex_t control_mutex = PTHREAD_MUTEX_INITIALIZER;
+pthread_cond_t control_cond = PTHREAD_COND_INITIALIZER;
+struct control_queue control_head;
+
+pthread_cond_t broadcast_cond = PTHREAD_COND_INITIALIZER;
+pthread_t broadcast_workers[BROADCAST_WORKERS];
+int broadcast_workers_running = 0;  // contador (opcional)
+
 /* Variáveis globais */
 DB *dbp = NULL;
 volatile sig_atomic_t running = 1;
@@ -62,6 +72,178 @@ void send_legacy_response(int fd, uint16_t status, uint16_t payload_len, const v
         memcpy(resp + 4, payload, payload_len);
     }
     send_full(fd, resp, 4 + payload_len, 0);
+}
+
+static void process_control_cmd(struct control_cmd *cmd) {
+    switch (cmd->type) {
+        case CMD_BROADCAST:
+            broadcast_sync(cmd->key, cmd->key_len,
+                           cmd->value, cmd->value_len,
+                           cmd->ts, cmd->node_id);
+            break;
+        case CMD_SHUTDOWN:
+            // já tratado pelo running
+            break;
+        default:
+            break;
+    }
+}
+
+static void scan_expired_entries(void) {
+    DBC *cursorp;
+    DBT key, data;
+    dbp->cursor(dbp, NULL, &cursorp, 0);
+    memset(&key, 0, sizeof(key));
+    memset(&data, 0, sizeof(data));
+    data.flags = DB_DBT_MALLOC;
+    uint64_t now = now_micros();
+    while (cursorp->get(cursorp, &key, &data, DB_NEXT) == 0) {
+        if (data.size >= sizeof(struct cache_entry)) {
+            struct cache_entry *entry = (struct cache_entry *)data.data;
+            if (entry->expire_at < now) {
+                // deleta
+                dbp->del(dbp, NULL, &key, 0);
+                // enfileira broadcast de DEL (opcional)
+                enqueue_broadcast((const char *)key.data, key.size,
+                                  NULL, 0, now, my_node_id);
+            }
+        }
+        free(data.data);
+        memset(&data, 0, sizeof(data));
+        data.flags = DB_DBT_MALLOC;
+    }
+    cursorp->close(cursorp);
+}
+
+static void *broadcast_worker_routine(void *arg) {
+    while (running) {
+        pthread_mutex_lock(&control_mutex);
+        // Só processa se a fila estiver acima do HIGH
+        while (queue_size <= HIGH_WATERMARK && running) {
+            pthread_cond_wait(&broadcast_cond, &control_mutex);
+        }
+        if (!running) {
+            pthread_mutex_unlock(&control_mutex);
+            break;
+        }
+        // Pega um comando
+        struct control_cmd *cmd = TAILQ_FIRST(&control_head);
+        if (cmd) {
+            TAILQ_REMOVE(&control_head, cmd, entries);
+            queue_size--;
+        }
+        pthread_mutex_unlock(&control_mutex);
+
+        if (cmd) {
+            process_control_cmd(cmd);
+            free(cmd);
+        }
+    }
+    return NULL;
+}
+
+static void *control_thread_routine(void *arg) {
+    struct timespec ts;
+    time_t last_scan = 0;
+
+    while (running) {
+        // =====================================================
+        // 1. Aguarda comandos ou timeout para TTL scan
+        // =====================================================
+        pthread_mutex_lock(&control_mutex);
+
+        // Enquanto a fila estiver vazia e o sistema estiver rodando, espera
+        while (TAILQ_EMPTY(&control_head) && running) {
+            clock_gettime(CLOCK_REALTIME, &ts);
+            ts.tv_sec += 5;   // timeout de 5 segundos para escanear TTL
+            pthread_cond_timedwait(&control_cond, &control_mutex, &ts);
+        }
+
+        // Se o sistema foi desligado, sai
+        if (!running) {
+            pthread_mutex_unlock(&control_mutex);
+            break;
+        }
+
+        // =====================================================
+        // 2. Processa comandos da fila
+        // =====================================================
+        struct control_cmd *cmd = TAILQ_FIRST(&control_head);
+        if (cmd) {
+            TAILQ_REMOVE(&control_head, cmd, entries);
+            control_queue_size--;
+            pthread_mutex_unlock(&control_mutex);
+
+            // Processa o comando (broadcast, etc.)
+            process_control_cmd(cmd);
+            free(cmd);
+
+            // Após processar, verificamos se a fila ainda está grande
+            // e acordamos os workers de broadcast se necessário
+            pthread_mutex_lock(&control_mutex);
+            if (control_queue_size > HIGH_WATERMARK) {
+                pthread_cond_broadcast(&broadcast_cond);
+            }
+            pthread_mutex_unlock(&control_mutex);
+        } else {
+            // Fila vazia (timeout ocorreu)
+            pthread_mutex_unlock(&control_mutex);
+        }
+
+        // =====================================================
+        // 3. Escaneia entradas expiradas (TTL) a cada 5 segundos
+        // =====================================================
+        time_t now = time(NULL);
+        if (now - last_scan >= 5) {
+            last_scan = now;
+            scan_expired_entries();   // implementada separadamente
+        }
+
+        // =====================================================
+        // 4. Gerencia os workers de broadcast com histerese
+        // =====================================================
+        pthread_mutex_lock(&control_mutex);
+        int qsize = control_queue_size;
+        pthread_mutex_unlock(&control_mutex);
+
+        if (qsize > HIGH_WATERMARK) {
+            // Se a fila está cheia, acorda os workers (se estiverem dormindo)
+            pthread_cond_broadcast(&broadcast_cond);
+        } else if (qsize < LOW_WATERMARK) {
+            // Se a fila está vazia, não faz nada – os workers
+            // vão dormir naturalmente no próximo loop deles.
+            // (Não há necessidade de forçar sono)
+        }
+        // Nota: a condição de espera dos workers já verifica qsize,
+        // então eles vão dormir sozinhos quando a fila estiver baixa.
+    }
+
+    return NULL;
+}
+
+void enqueue_broadcast(const char *key, size_t key_len,
+                       const void *value, size_t value_len,
+                       uint64_t ts, uint64_t node_id) {
+    size_t total_size = sizeof(struct control_cmd) + key_len + value_len;
+    struct control_cmd *cmd = malloc(total_size);
+    if (!cmd) return;
+    cmd->type = CMD_BROADCAST;
+    cmd->ts = ts;
+    cmd->node_id = node_id;
+    cmd->key_len = key_len;
+    cmd->value_len = value_len;
+    cmd->key = (uint8_t *)cmd + sizeof(struct control_cmd);
+    cmd->value = cmd->key + key_len;
+    memcpy(cmd->key, key, key_len);
+    if (value && value_len) {
+        memcpy(cmd->value, value, value_len);
+    } else {
+        cmd->value = NULL;  // ou cmd->value_len = 0
+    }
+    pthread_mutex_lock(&control_mutex);
+    TAILQ_INSERT_TAIL(&control_head, cmd, entries);
+    pthread_cond_signal(&control_cond);
+    pthread_mutex_unlock(&control_mutex);
 }
 
 int process_frame(int fd, struct dmmr_frame *frame, const uint8_t *payload,
@@ -110,12 +292,12 @@ int process_frame(int fd, struct dmmr_frame *frame, const uint8_t *payload,
                 ts_use = now_micros();
                 node_use = my_node_id;
             }
-            int rc = db_set_with_meta(key, key_len, ts_use, node_use, value, value_len);
+            uint64_t expire_at = now_micros() + TTL_DEFAULT;
+            int rc = db_set_with_meta(key, key_len, ts_use, node_use, value, value_len, expire_at);
             if (rc == 0) {
                 status = DMMR_PROTO_STATUS_OK;
-            }
-            if (opcode == OP_SET && !from_peer) {
-                broadcast_sync(key, key_len, value, value_len, ts_use, node_use);
+                if(!from_peer)
+                    enqueue_broadcast(key, key_len, value, value_len, ts_use, node_use);
             }
             break;
         }
@@ -126,7 +308,7 @@ int process_frame(int fd, struct dmmr_frame *frame, const uint8_t *payload,
             }
             if (!from_peer) {
                 uint64_t ts_del = now_micros();
-                broadcast_sync(key, key_len, NULL, 0, ts_del, my_node_id);
+                enqueue_broadcast(key, key_len, NULL, 0, ts_del, my_node_id);
             }
             break;
         }
@@ -383,6 +565,8 @@ int main(int argc, char *argv[]) {
     if (init_db() != 0) return 1;
 
     TAILQ_INIT(&queue_head);
+    TAILQ_INIT(&control_head);
+
     init_peers();
 
     worker_threads = malloc(sizeof(pthread_t) * worker_count);
@@ -457,6 +641,13 @@ int main(int argc, char *argv[]) {
         printf("Workers: %d, Node ID: %llu\n", worker_count, (unsigned long long) my_node_id);
     }
 
+    TAILQ_INIT(&control_head);
+    pthread_t control_thread;
+    pthread_create(&control_thread, NULL, control_thread_routine, NULL);
+    for (int i = 0; i < BROADCAST_WORKERS; i++) {
+    pthread_create(&broadcast_workers[i], NULL, broadcast_worker_routine, NULL);
+    }
+    
     /* Loop principal de accept */
     fd_set readfds;
     while (running) {
@@ -494,6 +685,8 @@ int main(int argc, char *argv[]) {
 
     /* Shutdown */
     running = 0;
+    pthread_cond_signal(&control_cond);   // acorda a thread de controle
+    pthread_join(control_thread, NULL);
     pthread_mutex_lock(&queue_mutex);
     pthread_cond_broadcast(&queue_cond);
     pthread_mutex_unlock(&queue_mutex);

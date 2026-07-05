@@ -19,4 +19,8 @@
 #define MAX_KEY_LEN 1024
 #define MAX_VALUE_LEN (1024 * 1024)
 
+#define HIGH_WATERMARK  50   // ativa workers quando a fila ultrapassar este valor
+#define LOW_WATERMARK   10   // desativa quando cair abaixo
+#define BROADCAST_WORKERS 2  // número máximo de workers auxiliares
+
 #endif /* DMMR_CONFIG_H */

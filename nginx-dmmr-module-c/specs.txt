@@ -1,0 +1,264 @@
+DMMR API Gateway
+Technical Architecture Description
+OVERVIEW
+
+The DMMR API Gateway is a native Nginx HTTP module designed to transform
+Nginx into a programmable API Gateway while preserving the performance
+characteristics of the original web server.
+
+Unlike solutions based on Lua, JavaScript or external runtimes, every
+request is processed entirely inside the native Nginx worker process.
+
+The project is implemented in ANSI C using the official Nginx Module API
+and follows the same architectural principles adopted by the Nginx core:
+
+- deterministic execution
+- minimal memory allocation
+- request pool allocation
+- event-driven processing
+- low latency
+- modular design
+
+The primary objective of the project is to provide an extensible API
+Gateway capable of request routing, authentication, rate limiting,
+plugin execution and upstream selection without introducing additional
+runtime dependencies.
+
+HIGH LEVEL ARCHITECTURE
+
+Every HTTP request follows the same processing pipeline.
+
+Client
+   |
+   v
+Route Resolution
+   |
+   v
+Authentication
+   |
+   v
+Rate Limiter
+   |
+   v
+Plugin Engine
+   |
+   v
+Upstream Resolver
+   |
+   v
+Native Nginx Proxy
+   |
+   v
+Backend Service
+
+Each processing stage performs exactly one responsibility.
+
+Modules communicate only through the request context allocated during
+request initialization.
+
+PROJECT ORGANIZATION
+
+The project is intentionally divided into small independent components.
+
+Core
+Coordinates the execution pipeline.
+
+Router
+Matches incoming requests against configured routes.
+
+Authentication
+Extracts credentials and validates them through the external cache
+service.
+
+Rate Limiter
+Performs request limiting using an in-memory Patricia Trie.
+
+Plugin Engine
+Provides extension points executed before proxy forwarding.
+
+Upstream Resolver
+Determines the final backend destination consumed by the native
+Nginx proxy module.
+
+REQUEST CONTEXT
+
+Every HTTP request owns a private context structure allocated from the
+Nginx request pool.
+
+The context stores all information produced during request processing.
+
+Typical information includes:
+
+- selected route
+- selected service
+- authentication status
+- rewritten URI
+- upstream destination
+- plugin data
+
+No global request state exists.
+
+This guarantees worker isolation while avoiding synchronization
+between requests.
+
+ROUTING
+
+The routing subsystem selects the destination service according to the
+configured routing table.
+
+Matching rules may include:
+
+- URI
+- HTTP Method
+- Host Header
+- Route Priority
+
+After a route is selected, optional URI rewriting may be performed.
+
+The resulting service descriptor becomes available to all subsequent
+processing stages.
+
+AUTHENTICATION
+
+Authentication is intentionally implemented as an external service.
+
+The gateway extracts credentials from the incoming request and forwards
+them to the authentication backend.
+
+Supported credential sources include:
+
+Authorization: Bearer
+
+Authorization: Token
+
+X-API-Key
+
+ApiKey
+
+Query Parameters
+
+The gateway never stores authentication information permanently.
+
+Its responsibility is limited to request validation.
+
+RATE LIMITER
+
+Rate limiting is implemented using an in-memory Patricia Trie.
+
+The implementation avoids external databases while providing efficient
+lookup and insertion.
+
+Expired entries are removed during normal processing.
+
+No Redis dependency exists.
+
+No shared database is required.
+
+PLUGIN ENGINE
+
+The plugin subsystem is designed as the primary extension mechanism.
+
+Plugins execute after authentication and before proxy forwarding.
+
+Typical responsibilities include:
+
+- header manipulation
+- request transformation
+- logging
+- metrics
+- filtering
+- authorization
+- auditing
+
+The plugin engine currently provides the execution infrastructure while
+remaining intentionally lightweight.
+
+UPSTREAM RESOLUTION
+
+The upstream subsystem converts the selected service into the final
+backend destination.
+
+Responsibilities include:
+
+- host selection
+- port selection
+- URI rewriting
+- upstream variables
+
+Actual HTTP forwarding is delegated to the native Nginx proxy module.
+
+MEMORY MODEL
+
+Memory allocation follows standard Nginx conventions.
+
+Configuration objects are allocated during configuration loading.
+
+Request objects are allocated from the request memory pool.
+
+Dynamic allocations during request processing are intentionally kept to
+a minimum.
+
+This reduces fragmentation while improving cache locality.
+
+DESIGN PRINCIPLES
+
+The project follows a small number of architectural rules.
+
+* Native Nginx execution only.
+
+* No embedded scripting language.
+
+* No external runtime dependency.
+
+* One responsibility per module.
+
+* Immutable configuration.
+
+* Explicit request context.
+
+* Deterministic execution flow.
+
+* Modular extensibility.
+
+* Low latency before feature richness.
+CURRENT IMPLEMENTATION
+
+Current functionality includes:
+
+- Route Resolution
+
+- Authentication Client
+
+- Rate Limiter
+
+- Plugin Infrastructure
+
+- Upstream Resolver
+
+- Native Proxy Integration
+
+The architecture has been designed so future features can be introduced
+without modifying the existing processing pipeline.
+
+INTENDED EVOLUTION
+
+Future development is expected to focus on:
+
+- Additional authentication providers
+
+- Dynamic plugin loading
+
+- Distributed rate limiting
+
+- Metrics exporters
+
+- Advanced traffic policies
+
+- Service discovery
+
+- Administrative API
+
+The overall architecture should remain stable while individual modules
+continue to evolve independently.
+
+END OF DOCUMENT

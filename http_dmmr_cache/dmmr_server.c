@@ -20,6 +20,7 @@
 #include <sys/queue.h>
 #include <time.h>
 #include <db.h>
+#include <fcntl.h>
 
 #define TTL_DEFAULT (3600ULL * 1000000ULL)
 
@@ -739,8 +740,54 @@ static void usage(const char *prog) {
             "  --cluster-port=P    Porta de cluster (padrão %d)\n"
             "  --peer=IP:PORT      Adiciona um peer\n"
             "  --node-id=N         ID do nó (64-bit)\n"
+            "  --daemon            Roda como daemon (foreground se omitido)\n"
             "  --help              Esta mensagem\n",
             prog, PORT, DEFAULT_WORKERS, CLUSTER_PORT);
+}
+
+static inline void daemonize(void) {
+    pid_t pid;
+
+    /* Primeiro fork: sair do processo pai */
+    pid = fork();
+    if (pid < 0) {
+        perror("fork");
+        exit(1);
+    }
+    if (pid > 0) {
+        exit(0); /* pai sai */
+    }
+
+    /* Tornar-se líder de sessão */
+    if (setsid() < 0) {
+        perror("setsid");
+        exit(1);
+    }
+
+    /* Segundo fork: garantir que não seja líder de sessão (opcional) */
+    pid = fork();
+    if (pid < 0) {
+        perror("fork2");
+        exit(1);
+    }
+    if (pid > 0) {
+        exit(0);
+    }
+
+    /* Mudar para diretório raiz (opcional - comente se quiser manter o atual) */
+    // chdir("/");
+
+    /* Redirecionar stdin, stdout, stderr para /dev/null */
+    int fd = open("/dev/null", O_RDWR);
+    if (fd < 0) {
+        perror("open /dev/null");
+        /* Continua mesmo sem redirecionamento */
+    } else {
+        dup2(fd, STDIN_FILENO);
+        dup2(fd, STDOUT_FILENO);
+        dup2(fd, STDERR_FILENO);
+        if (fd > 2) close(fd);
+    }
 }
 
 int main(int argc, char *argv[]) {
@@ -751,6 +798,7 @@ int main(int argc, char *argv[]) {
     int cluster_port = CLUSTER_PORT;
     pthread_t cluster_thread;
     pthread_t gc_thread;
+    int daemon_mode = 0;  /* 0 = foreground, 1 = daemon */
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--unix") == 0) use_unix = true;
@@ -775,6 +823,8 @@ int main(int argc, char *argv[]) {
             }
         } else if (strncmp(argv[i], "--node-id=", 10) == 0) {
             my_node_id = strtoull(argv[i] + 10, NULL, 0);
+        } else if (strcmp(argv[i], "--daemon") == 0) {
+            daemon_mode = 1;
         } else if (strcmp(argv[i], "--help") == 0) {
             usage(argv[0]);
             return 0;
@@ -784,6 +834,10 @@ int main(int argc, char *argv[]) {
     if (!use_unix && !use_tcp) use_unix = true;
     if (my_node_id == 0) {
         my_node_id = (uint64_t) time(NULL) ^ ((uint64_t) getpid() << 32);
+    }
+
+    if (daemon_mode) {
+        daemonize();
     }
 
     signal(SIGINT, signal_handler);

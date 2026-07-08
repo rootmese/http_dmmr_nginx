@@ -19,6 +19,7 @@
 #include <netinet/tcp.h>
 #include <sys/queue.h>
 #include <time.h>
+#include <db.h>
 
 #define TTL_DEFAULT (3600ULL * 1000000ULL)
 
@@ -40,6 +41,10 @@ int broadcast_workers_running = 0;
 DB *dbp = NULL;
 volatile sig_atomic_t running = 1;
 uint64_t my_node_id = 0;
+
+void enqueue_broadcast(const char *key, size_t key_len,
+                       const void *value, size_t value_len,
+                       uint64_t ts, uint64_t node_id);
 
 /* ============================================================
  * Fila de jobs  –  usa job_pool_entry do pool

@@ -5,6 +5,7 @@
 #include <stddef.h>
 #include <stdbool.h>
 #include <sys/queue.h>
+#include <arpa/inet.h>
 #include "dmmr_config.h"
 
 /* Opcodes e flags */

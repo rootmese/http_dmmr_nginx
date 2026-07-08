@@ -1,5 +1,6 @@
 #include "dmmr_net.h"
 #include <errno.h>
+#include <sys/socket.h>
 #include <unistd.h>
 
 ssize_t recv_full(int fd, void *buf, size_t len, int flags) {

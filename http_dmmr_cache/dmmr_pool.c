@@ -4,15 +4,6 @@
 #include <stdio.h>
 
 /* ============================================================
- * Macros auxiliares para implementar pools genéricos
- * ============================================================ */
-
-/*
- * Padrão do NOTES.txt: busca linear pela primeira entrada livre,
- * redimensiona dobrando quando cheio. Mutex próprio por pool.
- */
-
-/* ============================================================
  * Pool de payload_buf
  * ============================================================ */
 static struct payload_buf *payload_pool = NULL;
@@ -22,18 +13,17 @@ static pthread_mutex_t payload_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 struct payload_buf *get_payload_buf(void) {
     pthread_mutex_lock(&payload_mutex);
-
-    /* Busca linear pela primeira entrada livre */
-    for (unsigned i = 0; i < payload_pool_count; i++) {
-        if (payload_pool[i].in_use == 0) {
-            payload_pool[i].in_use = 1;
-            payload_pool[i].len = 0;
+    register struct payload_buf *p = payload_pool;
+    register struct payload_buf *p1 = payload_pool + payload_pool_size;
+    for (; p < p1; ++p) {
+        if (!(p->in_use)) {
+            p->in_use = 1;
+            p->len = 0;
             pthread_mutex_unlock(&payload_mutex);
-            return &payload_pool[i];
+            return p;
         }
     }
 
-    /* Pool cheio: expandir ou usar nova entrada */
     if (payload_pool_count >= payload_pool_size) {
         unsigned new_size = (payload_pool_size == 0) ? POOL_INITIAL_SIZE : (payload_pool_size * 2);
         struct payload_buf *tmp = realloc(payload_pool, new_size * sizeof(struct payload_buf));
@@ -41,13 +31,12 @@ struct payload_buf *get_payload_buf(void) {
             pthread_mutex_unlock(&payload_mutex);
             return NULL;
         }
-        /* Zera as novas entradas */
         memset(tmp + payload_pool_size, 0, (new_size - payload_pool_size) * sizeof(struct payload_buf));
         payload_pool = tmp;
         payload_pool_size = new_size;
     }
 
-    struct payload_buf *ret = &payload_pool[payload_pool_count++];
+    struct payload_buf *ret = payload_pool + payload_pool_count++;
     ret->in_use = 1;
     ret->len = 0;
     pthread_mutex_unlock(&payload_mutex);
@@ -55,11 +44,12 @@ struct payload_buf *get_payload_buf(void) {
 }
 
 void release_payload_buf(struct payload_buf *p) {
-    if (!p) return;
-    pthread_mutex_lock(&payload_mutex);
-    p->in_use = 0;
-    p->len = 0;
-    pthread_mutex_unlock(&payload_mutex);
+    if (p) {
+        pthread_mutex_lock(&payload_mutex);
+        p->in_use = 0;
+        p->len = 0;
+        pthread_mutex_unlock(&payload_mutex);
+    }
 }
 
 /* ============================================================
@@ -72,13 +62,14 @@ static pthread_mutex_t job_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 struct job_pool_entry *get_job_entry(void) {
     pthread_mutex_lock(&job_mutex);
-
-    for (unsigned i = 0; i < job_pool_count; i++) {
-        if (job_pool[i].in_use == 0) {
-            job_pool[i].in_use = 1;
-            job_pool[i].fd = -1;
+    register struct job_pool_entry *p = job_pool;
+    register struct job_pool_entry *p1 = job_pool + job_pool_size;
+    for (; p < p1; ++p) {
+        if (!(p->in_use)) {
+            p->in_use = 1;
+            p->fd = -1;
             pthread_mutex_unlock(&job_mutex);
-            return &job_pool[i];
+            return p;
         }
     }
 
@@ -94,7 +85,7 @@ struct job_pool_entry *get_job_entry(void) {
         job_pool_size = new_size;
     }
 
-    struct job_pool_entry *ret = &job_pool[job_pool_count++];
+    struct job_pool_entry *ret = job_pool + job_pool_count++;
     ret->in_use = 1;
     ret->fd = -1;
     pthread_mutex_unlock(&job_mutex);
@@ -102,11 +93,12 @@ struct job_pool_entry *get_job_entry(void) {
 }
 
 void release_job_entry(struct job_pool_entry *p) {
-    if (!p) return;
-    pthread_mutex_lock(&job_mutex);
-    p->in_use = 0;
-    p->fd = -1;
-    pthread_mutex_unlock(&job_mutex);
+    if (p) {
+        pthread_mutex_lock(&job_mutex);
+        p->in_use = 0;
+        p->fd = -1;
+        pthread_mutex_unlock(&job_mutex);
+    }
 }
 
 /* ============================================================
@@ -119,12 +111,13 @@ static pthread_mutex_t cmd_pool_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 struct control_cmd_pooled *get_control_cmd(void) {
     pthread_mutex_lock(&cmd_pool_mutex);
-
-    for (unsigned i = 0; i < cmd_pool_count; i++) {
-        if (cmd_pool[i].in_use == 0) {
-            cmd_pool[i].in_use = 1;
+    register struct control_cmd_pooled *p = cmd_pool;
+    register struct control_cmd_pooled *p1 = cmd_pool + cmd_pool_size;
+    for (; p < p1; ++p) {
+        if (!(p->in_use)) {
+            p->in_use = 1;
             pthread_mutex_unlock(&cmd_pool_mutex);
-            return &cmd_pool[i];
+            return p;
         }
     }
 
@@ -140,20 +133,21 @@ struct control_cmd_pooled *get_control_cmd(void) {
         cmd_pool_size = new_size;
     }
 
-    struct control_cmd_pooled *ret = &cmd_pool[cmd_pool_count++];
+    struct control_cmd_pooled *ret = cmd_pool + cmd_pool_count++;
     ret->in_use = 1;
     pthread_mutex_unlock(&cmd_pool_mutex);
     return ret;
 }
 
 void release_control_cmd(struct control_cmd_pooled *p) {
-    if (!p) return;
-    pthread_mutex_lock(&cmd_pool_mutex);
-    p->in_use = 0;
-    p->value = NULL;
-    p->value_len = 0;
-    p->key_len = 0;
-    pthread_mutex_unlock(&cmd_pool_mutex);
+    if (p) {
+        pthread_mutex_lock(&cmd_pool_mutex);
+        p->in_use = 0;
+        p->value = NULL;
+        p->value_len = 0;
+        p->key_len = 0;
+        pthread_mutex_unlock(&cmd_pool_mutex);
+    }
 }
 
 /* ============================================================
@@ -166,12 +160,13 @@ static pthread_mutex_t del_pool_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 struct delete_entry *get_delete_entry(void) {
     pthread_mutex_lock(&del_pool_mutex);
-
-    for (unsigned i = 0; i < del_pool_count; i++) {
-        if (del_pool[i].in_use == 0) {
-            del_pool[i].in_use = 1;
+    register struct delete_entry *p = del_pool;
+    register struct delete_entry *p1 = del_pool + del_pool_size;
+    for (; p < p1; ++p) {
+        if (!(p->in_use)) {
+            p->in_use = 1;
             pthread_mutex_unlock(&del_pool_mutex);
-            return &del_pool[i];
+            return p;
         }
     }
 
@@ -187,18 +182,19 @@ struct delete_entry *get_delete_entry(void) {
         del_pool_size = new_size;
     }
 
-    struct delete_entry *ret = &del_pool[del_pool_count++];
+    struct delete_entry *ret = del_pool + del_pool_count++;
     ret->in_use = 1;
     pthread_mutex_unlock(&del_pool_mutex);
     return ret;
 }
 
 void release_delete_entry(struct delete_entry *p) {
-    if (!p) return;
-    pthread_mutex_lock(&del_pool_mutex);
-    p->in_use = 0;
-    p->key_len = 0;
-    pthread_mutex_unlock(&del_pool_mutex);
+    if (p) {
+        pthread_mutex_lock(&del_pool_mutex);
+        p->in_use = 0;
+        p->key_len = 0;
+        pthread_mutex_unlock(&del_pool_mutex);
+    }
 }
 
 /* ============================================================

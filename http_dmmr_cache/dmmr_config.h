@@ -1,6 +1,14 @@
 #ifndef DMMR_CONFIG_H
 #define DMMR_CONFIG_H
 
+#include <stdio.h>
+
+#ifdef DEBUG
+#define DMMR_LOG_DEBUG(fmt, ...) fprintf(stderr, "[DEBUG] " fmt "\n", ##__VA_ARGS__)
+#else
+#define DMMR_LOG_DEBUG(fmt, ...) do {} while(0)
+#endif
+
 #define DMMR_MAGIC 0xD4D4u
 #define DMMR_VERSION 1
 #define DMMR_PROTO_OP_GET 1

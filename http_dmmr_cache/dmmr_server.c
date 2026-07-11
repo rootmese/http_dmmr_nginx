@@ -440,11 +440,11 @@ void enqueue_broadcast(const char *key, size_t key_len,
  * ============================================================ */
 int process_frame(int fd, struct dmmr_frame *frame, const uint8_t *payload,
                   uint64_t source_node_id, bool from_peer) {
-    uint16_t opcode = ntohs(frame->opcode);
-    uint16_t flags = ntohs(frame->flags);
-    uint32_t key_len = ntohl(frame->key_len);
-    uint32_t value_len = ntohl(frame->value_len);
-    uint64_t ts = ntohll(frame->timestamp);
+    uint16_t opcode = frame->opcode;
+    uint16_t flags = frame->flags;
+    uint32_t key_len = frame->key_len;
+    uint32_t value_len = frame->value_len;
+    uint64_t ts = frame->timestamp;
 
     (void)flags;   /* suprime warning de variável não usada */
 
@@ -461,6 +461,7 @@ int process_frame(int fd, struct dmmr_frame *frame, const uint8_t *payload,
 
     switch (opcode) {
         case OP_GET: {
+            DMMR_LOG_DEBUG("process_frame: OP_GET key='%.*s'", (int)key_len, key);
             uint64_t ts_found = 0, node_found = 0, expire_at = 0;
             void *memory = NULL;
             size_t value_len_out = 0;
@@ -476,6 +477,7 @@ int process_frame(int fd, struct dmmr_frame *frame, const uint8_t *payload,
         }
         case OP_SET:
         case OP_SYNC: {
+            DMMR_LOG_DEBUG("process_frame: %s key='%.*s', value_len=%u", (opcode == OP_SET ? "OP_SET" : "OP_SYNC"), (int)key_len, key, value_len);
             if (value_len == 0) {
                 status = DMMR_PROTO_STATUS_ERROR;
                 break;
@@ -496,6 +498,7 @@ int process_frame(int fd, struct dmmr_frame *frame, const uint8_t *payload,
             break;
         }
         case OP_DEL: {
+            DMMR_LOG_DEBUG("process_frame: OP_DEL key='%.*s'", (int)key_len, key);
             int rc = db_del_key(key, key_len);
             if (rc == 0) {
                 status = DMMR_PROTO_STATUS_OK;
@@ -634,6 +637,7 @@ int process_legacy_request(int fd, uint16_t opcode, uint16_t key_len, const uint
         return -1;
     }
 
+    DMMR_LOG_DEBUG("process_legacy_request: OP_GET legacy key='%.*s'", (int)key_len, payload);
     uint64_t ts_found = 0, node_found = 0, expire_at = 0;
     void *value = NULL;
     size_t value_len = 0;

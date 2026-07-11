@@ -81,7 +81,7 @@ ngx_http_dmmr_rate_create_node(ngx_http_request_t *r, ngx_str_t *key,
 
 static ngx_http_dmmr_rate_node_t *
 ngx_http_dmmr_rate_prune_node(ngx_http_request_t *r, ngx_http_dmmr_rate_node_t *node,
-                              ngx_msec_t now)
+                              ngx_msec_t now, ngx_msec_t rate_window)
 {
     if (node == NULL) {
         return NULL;
@@ -97,8 +97,8 @@ ngx_http_dmmr_rate_prune_node(ngx_http_request_t *r, ngx_http_dmmr_rate_node_t *
         return node;
     }
 
-    node->child[0] = ngx_http_dmmr_rate_prune_node(r, node->child[0], now);
-    node->child[1] = ngx_http_dmmr_rate_prune_node(r, node->child[1], now);
+    node->child[0] = ngx_http_dmmr_rate_prune_node(r, node->child[0], now, rate_window);
+    node->child[1] = ngx_http_dmmr_rate_prune_node(r, node->child[1], now, rate_window);
 
     if (node->child[0] == NULL && node->child[1] == NULL) {
         ngx_free(node);
@@ -222,7 +222,7 @@ ngx_http_dmmr_rate_limit(ngx_http_request_t *r, ngx_http_dmmr_ctx_t *ctx)
     }
 
     now = ngx_current_msec;
-    rate_root = ngx_http_dmmr_rate_prune_node(r, rate_root, now);
+    rate_root = ngx_http_dmmr_rate_prune_node(r, rate_root, now, rate_window);
 
     node = ngx_http_dmmr_rate_insert_node(r, &client_key, now, &found);
     if (node == NULL) {

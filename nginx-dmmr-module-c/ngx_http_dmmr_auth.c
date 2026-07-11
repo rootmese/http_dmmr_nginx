@@ -285,7 +285,7 @@ ngx_http_dmmr_send_cache_request(ngx_http_request_t *r, ngx_str_t *api_key, ngx_
         return NGX_ERROR;
     }
 
-    if (api_key->len > 0xFFFF) {
+    if (api_key->len > sizeof(req_buf) - sizeof(frame)) {
         return NGX_ERROR;
     }
 
@@ -327,14 +327,6 @@ ngx_http_dmmr_send_cache_request(ngx_http_request_t *r, ngx_str_t *api_key, ngx_
             return NGX_ERROR;
         }
         total += (size_t) n;
-        if (total >= 4) {
-            break;
-        }
-    }
-
-    if (total < 8) {
-        ngx_http_dmmr_cache_close_conn(&ngx_http_dmmr_cache_conn);
-        return NGX_ERROR;
     }
 
     status = ntohs(*(uint16_t *) resp_buf);

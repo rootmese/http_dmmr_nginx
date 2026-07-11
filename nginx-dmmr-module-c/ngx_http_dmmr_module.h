@@ -59,7 +59,6 @@ typedef struct {
 } ngx_http_dmmr_conf_t;
 
 /* Funções públicas */
-ngx_int_t ngx_http_dmmr_handler(ngx_http_request_t *r);
 ngx_int_t ngx_http_dmmr_router(ngx_http_request_t *r, ngx_http_dmmr_ctx_t *ctx);
 ngx_int_t ngx_http_dmmr_auth(ngx_http_request_t *r, ngx_http_dmmr_ctx_t *ctx);
 ngx_int_t ngx_http_dmmr_rate_init(ngx_cycle_t *cycle);

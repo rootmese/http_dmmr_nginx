@@ -116,7 +116,6 @@ ngx_http_dmmr_rate_insert_node(ngx_http_request_t *r, ngx_str_t *key,
     ngx_http_dmmr_rate_node_t *node;
     ngx_http_dmmr_rate_node_t *new_leaf;
     ngx_http_dmmr_rate_node_t *branch;
-    ngx_uint_t bit;
     ngx_uint_t child_bit;
 
     *found = 0;

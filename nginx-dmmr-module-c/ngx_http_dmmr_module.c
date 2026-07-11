@@ -1,8 +1,7 @@
 #include "ngx_http_dmmr_module.h"
-#include <ngx_http_proxy_module.h>
 
 /* Handler principal */
-static ngx_int_t
+ngx_int_t
 ngx_http_dmmr_handler(ngx_http_request_t *r)
 {
     ngx_http_dmmr_conf_t *kcf;
@@ -60,14 +59,14 @@ ngx_http_dmmr_handler(ngx_http_request_t *r)
         return rc;
     }
 
-    /* 5. Define upstream e faz proxy */
+    /* 5. Define upstream */
     rc = ngx_http_dmmr_upstream(r, ctx);
     if (rc != NGX_OK) {
         return rc;
     }
 
-    /* Se tudo ok, chama o handler de proxy */
-    return ngx_http_proxy_handler(r);
+    /* O proxy será executado pela diretiva proxy_pass usando $dmmr_upstream */
+    return NGX_OK;
 }
 
 /* Configuração: define rotas via diretivas */
@@ -159,7 +158,7 @@ ngx_http_dmmr_route(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 }
 
 static char *
-nngx_http_dmmr_rate_limit_set(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
+ngx_http_dmmr_rate_limit_set(ngx_conf_t *cf, ngx_command_t *cmd, void *conf)
 {
     ngx_http_dmmr_conf_t *kcf = conf;
     ngx_str_t *value;
@@ -217,11 +216,11 @@ static ngx_command_t ngx_http_dmmr_commands[] = {
       NULL },
 
     { ngx_string("dmmr_route"),
-      NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_TAKE3,
-      ngx_http_dmmr_route,
-      NGX_HTTP_LOC_CONF_OFFSET,
-      0,
-      NULL },
+    NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_TAKE2,
+    ngx_http_dmmr_route,
+    NGX_HTTP_LOC_CONF_OFFSET,
+    0,
+    NULL },
 
     { ngx_string("dmmr_cache_addr"),
       NGX_HTTP_MAIN_CONF|NGX_HTTP_SRV_CONF|NGX_HTTP_LOC_CONF|NGX_CONF_TAKE1,

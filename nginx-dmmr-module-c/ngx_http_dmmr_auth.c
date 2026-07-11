@@ -70,23 +70,23 @@ ngx_http_dmmr_extract_credential(ngx_http_request_t *r, ngx_str_t *credential)
         return NGX_OK;
     }
 
-    args = r->args;
-    if (args.len > 0) {
-        p = ngx_strstr(args.data, "apikey=");
-        if (p == NULL) {
-            p = ngx_strstr(args.data, "token=");
-        }
-        if (p != NULL) {
-            p += (p[0] == 'a') ? 7 : 6;
-            end = p;
-            while (*end && *end != '&') {
-                end++;
-            }
-            credential->data = p;
-            credential->len = end - p;
-            return NGX_OK;
-        }
+args = r->args;
+if (args.len > 0) {
+    p = (u_char *) ngx_strstr(args.data, "apikey=");
+    if (p == NULL) {
+        p = (u_char *) ngx_strstr(args.data, "token=");
     }
+    if (p != NULL) {
+        p += (p[0] == 'a') ? 7 : 6;
+        end = p;
+        while (*end && *end != '&') {
+            end++;
+        }
+        credential->data = p;
+        credential->len = end - p;
+        return NGX_OK;
+    }
+}
 
     return NGX_DECLINED;
 }
@@ -269,7 +269,6 @@ ngx_http_dmmr_send_cache_request(ngx_http_request_t *r, ngx_str_t *api_key, ngx_
         uint64_t timestamp;
     } frame;
     size_t total = 0;
-    size_t payload_len = 0;
     ssize_t n;
     uint16_t status;
     uint32_t resp_len;

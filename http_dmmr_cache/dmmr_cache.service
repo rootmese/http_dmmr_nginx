@@ -1,0 +1,27 @@
+[Unit]
+Description=DMMR Cache Daemon
+Documentation=https://github.com/rootmese/http_dmmr_nginx
+After=network.target
+
+[Service]
+Type=simple
+
+# Ajuste conforme a instalação
+WorkingDirectory=/opt/dmmr
+ExecStart=/opt/dmmr/dmmr_cache
+
+Restart=on-failure
+RestartSec=2
+
+User=root
+Group=root
+
+# Logs
+StandardOutput=journal
+StandardError=journal
+
+# Limites
+LimitNOFILE=65535
+
+[Install]
+WantedBy=multi-user.target

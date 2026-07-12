@@ -1,345 +1,431 @@
-# DMMR Roadmap and TODO (Updated)
+# DMMR Roadmap
 
 ## Current Status
 
-The project already includes:
+### Core Features
 
-- Configurable cache address via `dmmr_cache_addr`
-- Support for Unix socket and TCP modes
-- Persistent connection reuse in the Nginx module
+- Native Nginx module
 - Binary protocol between Nginx module and cache daemon
-- Basic reconnection logic on broken sockets
+- Berkeley DB persistence
+- TCP transport
+- Unix Socket transport
+- Configurable cache address via `dmmr_cache_addr`
+- Persistent connection reuse
+- Automatic reconnection
+- API Key authentication
+- Dynamic routing
+- Rate limiting
 
 ---
 
-# 1. Critical Bug Fixes (HIGH PRIORITY)
+# Phase 1 — Stabilization (Highest Priority)
 
 ## Memory Safety
-- Fix buffer overflow risk in `handle_binary_request`
-  - Ensure strict bounds: `key_len <= sizeof(req_buf) - 5`
-  - Ensure safe null termination
+
+- Eliminate buffer overflow risks
+- Validate all packet lengths
+- Strict bounds checking
+- Safe string termination
 
 ---
 
-## Protocol Correctness
-- Fix incorrect payload length handling with `htons(payload_len)`
-  - `send()` must use raw length
-  - network-order only for protocol headers
+## Binary Protocol Robustness
 
-- Handle partial `recv()` / `send()` correctly
-  - Implement full read/write loops
-  - Prevent fragmented frame parsing
-
-- Fix header fragmentation assumption (first 4 bytes)
-  - Buffer until full header is received before parsing
+- Handle partial `recv()`
+- Handle partial `send()`
+- Correct header parsing
+- Correct payload length handling
+- Protect against malformed packets
+- Gracefully reject invalid frames
+- Never crash on malformed input
 
 ---
 
 ## Nginx Module Stability
-- Remove blocking I/O in Nginx worker context (`send/recv`)
-  - Risk: event loop blocking (~500ms)
-  - Fix options:
-    - ngx event-driven non-blocking model
-    - worker thread offload
 
-- Validate persistent socket before reuse
-  - `SO_ERROR` check
-  - Optional heartbeat mechanism
+- Validate persistent sockets before reuse
+- Improve reconnection logic
+- Remove blocking operations from the Nginx worker context
+- Prepare an event-driven communication layer
 
 ---
 
-## Authentication Safety
-- Remove or disable static fallback authentication
-  - Prevent bypass if backend is unavailable
-  - Make fallback explicit and opt-in only
+## Authentication
+
+- Remove static fallback authentication
+- Externalize credentials
+- Add optional shared secret between Nginx module and daemon
 
 ---
 
-# 2. Planned Improvements
+# Phase 2 — Runtime Architecture
 
-## 2.1 Rate Limiter Refactor
-- Replace RBTree-based limiter with hash-based structure
-- Remove full-tree traversal per request
-- Introduce:
-  - time-bucket strategy
-  - or sliding-window hash model
-- Target: O(1) average lookup and eviction
+## Runtime Separation
 
----
+Separate runtime management from server implementation.
 
-## 2.2 Cache Daemon Keep-Alive
-- Keep client connections persistent across requests
-- Detect disconnect via zero-byte reads
-- Add idle timeout to avoid orphan connections
-- Reduce syscall overhead and socket churn
+### Core Server
 
----
+- Initialize memory pools
+- Initialize Berkeley DB
+- Start worker threads
+- Start control threads
+- Create listening sockets
+- Execute listener loop
+- Perform graceful shutdown
 
-## 2.3 Connection Model Hardening
-- Remove global shared connection state in the module
-- Introduce:
-  - per-worker state OR
-  - connection pool abstraction
-- Prepare system for future concurrency scaling
+### Runtime Layer
+
+Support multiple execution modes:
+
+- Foreground
+- Daemon (Unix double-fork)
+- Container (Docker, systemd, Supervisor)
 
 ---
 
-## 2.4 Configuration & Deployment
-- Make runtime parameters configurable:
-  - Unix socket path
-  - database path
-  - TTL values
+## Listener Abstraction
 
-- Introduce optional config file:
-  - `dmmr_cache.conf`
+Provide interchangeable listener implementations.
 
-- Improve Nginx directive documentation:
-  - `dmmr_enable`
-  - `dmmr_service`
-  - `dmmr_route`
-  - `dmmr_cache_addr`
-
----
-
-## 2.5 Observability (DUAL-PLANE REQUIREMENT)
-
-### Important rule
-Any observability feature requires changes in both:
-- cache daemon
-- Nginx module (consumer layer)
-
----
-
-### Metrics to expose
-
-#### Cache daemon
-- request latency (p50/p95 optional)
-- request count
-- error rate
-- cache hit/miss ratio
-- rate limit triggers
-- control queue size
-- active workers
-
-#### Nginx module
-- consume metrics from daemon via:
-  - internal socket command
-  - status endpoint
-  - or lightweight binary protocol
-
-- optionally expose metrics to Nginx variables / headers / internal endpoints
-
----
-
-### Status / control interface
-- `/status` endpoint or internal socket commands:
-  - `PING`
-  - `STATUS`
-  - `STATS`
-
-- Must be low-latency and non-blocking
-
----
-
-## 2.6 Server Runtime Architecture
-
-Refactor the server bootstrap and listener loop into independent runtime components.
-
-### Goals
-
-- Separate server initialization from runtime management.
-- Keep protocol, cache and worker logic independent from execution mode.
-- Preserve POSIX portability as the default implementation.
-- Prepare the project for multiple deployment models without changing the core server logic.
-
-### Planned architecture
-
-Core server:
-
-- server_main()
-  - initialize pools
-  - initialize Berkeley DB
-  - start worker threads
-  - start control threads
-  - create listening sockets
-  - execute listener loop
-  - perform graceful shutdown
-
-Runtime layer:
-
-- foreground mode
-- daemon mode (Unix double-fork)
-- container mode (foreground process managed by Docker, systemd or Supervisor)
-
-### Listener abstraction
-
-Encapsulate the connection acceptance loop behind a dedicated interface.
-
-Default implementation:
+### Default
 
 - POSIX `select()`
 
-Platform-specific implementations may be provided through conditional compilation (`#ifdef`) while preserving the same public interface.
+### Optional
 
-Examples include:
-
-- `kqueue` on BSD systems
-- `epoll` on Linux systems
+- Linux `epoll`
+- BSD `kqueue`
 
 The server core must remain independent of the underlying event notification mechanism.
 
-### Benefits
+---
 
-- Cleaner `main()`
-- Better separation between runtime and server logic
-- Improved POSIX portability
-- Easier platform-specific optimization
-- Simpler long-term maintenance
+## Connection Model
+
+- Per-worker connections
+- Optional connection pool
+- Socket validation before reuse
+- Idle timeout
+- Keep-alive support
 
 ---
 
-# 3. Security Hardening
+# Phase 3 — Performance
 
-- Remove hardcoded API keys from source code
-- Externalize authentication storage (config or secure store)
-- Add optional shared secret between Nginx module and daemon
+## Rate Limiter Refactor
+
+Replace the current RBTree implementation.
+
+Possible implementations:
+
+- Hash table
+- Time buckets
+- Sliding window
+
+Target complexity:
+
+- O(1) average lookup
+- O(1) eviction
+
+---
+
+## Cache Runtime Optimization
+
+- Reduce socket churn
+- Keep client connections persistent
+- Idle connection cleanup
+- Lower syscall overhead
+
+---
+
+## Binary Protocol Optimization
+
+- Reduce memory copies
+- Buffer reuse
+- Batch operations where appropriate
+
+---
+
+# Phase 4 — Configuration
+
+## Runtime Configuration
+
+Support configuration through:
+
+- Environment variables
+- Configuration file (`dmmr_cache.conf`)
+
+Configuration precedence:
+
+1. Environment variables
+2. Configuration file
+3. Default values
+
+Supported settings:
+
+- TCP port
+- Cluster port
+- Unix socket path
+- Berkeley DB path
+- TTL
+- Log level
+- Worker count
+
+---
+
+# Phase 5 — Observability
+
+## Health Interface
+
+Commands:
+
+- `PING`
+- `STATUS`
+- `STATS`
+
+Requirements:
+
+- Non-blocking
+- Low latency
+- Lightweight implementation
+
+---
+
+## Metrics
+
+### Cache Daemon
+
+Expose:
+
+- Request count
+- Request latency
+- Cache hit ratio
+- Cache miss ratio
+- Error count
+- Rate limit triggers
+- Queue depth
+- Active workers
+
+### Nginx Module
+
+Consume daemon metrics only.
+
+The Nginx module must **never compute metrics itself**.
+
+---
+
+## Structured Logging
+
+Support log levels:
+
+- DEBUG
+- INFO
+- WARN
+- ERROR
+
+Optional:
+
+- JSON logging
+
+---
+
+# Phase 6 — Cluster
+
+## Peer Management
+
+- Heartbeat mechanism
+- Peer discovery
+- Failure detection
+- Retry with exponential backoff
+
+Peer states:
+
+- Active
+- Degraded
+- Offline
+
+---
+
+## Replication
+
+Future replication support:
+
+- Asynchronous replication
+- Write propagation
+- Replication acknowledgements
+- Conflict handling
+
+---
+
+# Phase 7 — Protocol Evolution
+
+## Frame Fragmentation (Chunking)
+
+Support payloads larger than a single protocol frame.
+
+Features:
+
+- Message ID
+- Sequence number
+- FIRST / MORE / LAST flags
+- Reassembly buffer
+- Timeout cleanup
+- Memory limits
+
+---
+
+## Protocol Versioning
+
+Support multiple protocol versions.
+
+Example:
+
+- v1
+- v2
+- Future extensions
+
+Maintain backward compatibility whenever possible.
+
+---
+
+# Phase 8 — Security
+
+## Security Hardening
+
+- Remove hardcoded API keys
+- External authentication storage
+- Shared secret between module and daemon
 - Optional TLS support for TCP mode
-- Ensure rate limiting uses trusted IP only (avoid spoofable headers)
+- Trusted client validation
+- Binary protocol fuzz hardening
 
 ---
 
-# 4. NEW FEATURES (ADDED REQUIREMENTS)
+# Phase 9 — Testing & Validation
 
-## 4.1 Environment-Based Configuration
-Support configuration via environment variables:
+## Integration Testing
 
-Examples:
-- `DMMR_TCP_PORT`
-- `DMMR_CLUSTER_PORT`
-- `DMMR_TTL_SECONDS`
-- `DMMR_CACHE_PATH`
-- `DMMR_LOG_LEVEL`
+Validate:
 
-### Impact:
-- Cache daemon
-- Nginx module (config loader + precedence rules)
-
----
-
-## 4.2 Health Check Endpoint
-- Internal endpoint or socket command:
-  - `PING`
-  - `STATUS`
-
-### Requirements:
-- Extremely fast response (<1ms ideal)
-- Must not block request path
-- Must be consumable by Nginx module
-
----
-
-## 4.3 Control Queue Monitoring
-- Expose internal queue metrics:
-  - queue depth
-  - pending tasks
-  - dequeue rate
-  - worker backlog
-
-### Impact:
-- Cache daemon instrumentation
-- Nginx module optional consumption layer
-
----
-
-## 4.4 Peer Failure Handling
-- Detect non-responsive peers:
-  - timeout-based detection
-  - heartbeat failure detection
-
-- Mark peers as:
-  - inactive
-  - degraded
-
-- Retry with backoff strategy
-
-### Impact:
-- control thread in cache daemon
-- optional exposure via `/status`
-- Nginx routing decisions may avoid dead peers
-
----
-
-## 4.5 Persistence (Berkeley DB)
-- Persistence already implemented via Berkeley DB
-
-### Deployment requirement:
-- Mount persistent volume in container
-- Ensure:
-  - data durability across restarts
-  - safe recovery on startup
-
----
-
-# 5. Testing & Validation Plan
-
-## Integration Tests
-- Unix socket mode
 - TCP mode
-- daemon restart + reconnection
-- peer failure simulation
-- fallback behavior when cache is unavailable
+- Unix Socket mode
+- Daemon restart
+- Automatic reconnection
+- Peer failures
+- Cache fallback behavior
 
 ---
 
 ## Load Testing
-- Tools: `wrk`, `vegeta`
-- Measure:
-  - latency
-  - throughput
-  - baseline vs optimized versions
+
+Tools:
+
+- wrk
+- vegeta
+
+Measure:
+
+- Throughput
+- Latency
+- CPU usage
+- Memory usage
 
 ---
 
 ## Security Testing
-- Fuzz binary protocol parser
+
+- Binary protocol fuzzing
 - Malformed packet injection
 - Authentication bypass attempts
+- Invalid frame handling
 
 ---
 
-## Observability Validation
-- Ensure consistency between:
-  - daemon metrics
-  - Nginx exposed metrics
+## Regression Testing
+
+Maintain an automated functional test suite covering:
+
+- Binary protocol
+- Routing
+- Authentication
+- Persistence
+- Rate limiting
+- TCP mode
+- Unix Socket mode
 
 ---
 
-# 6. Suggested Implementation Order (Revised)
+# Long-Term Goals
 
-1. Fix memory safety + protocol correctness
-2. Remove static authentication fallback
-3. Fix partial I/O handling + header parsing
-4. Add socket liveness validation
-5. Implement environment-based configuration
-6. Implement health check endpoint (daemon + Nginx consumer)
-7. Add control queue monitoring
-8. Implement peer failure handling
-9. Refactor rate limiter to hash-based model
-10. Implement keep-alive connection model
-11. Harden connection model (pool / per-worker)
-12. Add persistence deployment layer (volumes)
-13. Implement metrics + structured logging (dual-plane)
-14. Full testing, benchmarking, and fuzzing pipeline
+- Cluster replication
+- Multi-node synchronization
+- Hot reload
+- Zero-downtime upgrades
+- Pluggable storage backends
+- HTTP/3 support
+- Prometheus / OpenMetrics exporter
+- Distributed rate limiting
 
 ---
 
-# Notes
+# Recommended Implementation Order
 
-- Observability is always a dual-plane feature:
-  - daemon exposes data
-  - Nginx consumes and optionally forwards it
+## Phase 1 — Stabilization
 
-- Nginx must never “compute” metrics itself
-  - it only acts as a consumer layer
+1. Memory safety
+2. Binary protocol correctness
+3. Authentication hardening
+4. Socket validation
 
-- Cache daemon is the single source of truth
+---
+
+## Phase 2 — Foundation
+
+5. Runtime architecture
+6. Connection model
+7. Configuration system
+
+---
+
+## Phase 3 — Observability
+
+8. Health interface
+9. Metrics
+10. Structured logging
+
+---
+
+## Phase 4 — Performance
+
+11. Rate limiter optimization
+12. Keep-alive improvements
+
+---
+
+## Phase 5 — Advanced Features
+
+13. Frame fragmentation (chunking)
+14. Cluster management
+15. Replication
+
+---
+
+## Phase 6 — Validation
+
+16. Benchmarking
+17. Fuzz testing
+18. Continuous regression pipeline
+
+---
+
+# Design Principles
+
+- The cache daemon is the **single source of truth**.
+- Observability is always a **dual-plane feature**:
+  - The daemon exposes data.
+  - The Nginx module consumes and optionally forwards it.
+- The Nginx module should never calculate metrics.
+- The binary protocol must remain backward compatible whenever possible.
+- Security and robustness take precedence over new features.
+- Performance optimizations must never compromise protocol correctness.

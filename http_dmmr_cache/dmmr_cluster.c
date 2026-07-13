@@ -35,6 +35,9 @@ struct peer {
 TAILQ_HEAD(peer_list, peer) peers_head;
 pthread_mutex_t peers_mutex = PTHREAD_MUTEX_INITIALIZER;
 
+/* Descritor do socket de cluster (GLOBAL, não static) */
+int cluster_listen_fd = -1;
+
 void init_peers(void) {
     TAILQ_INIT(&peers_head);
 }
@@ -107,6 +110,7 @@ static int peer_connect(struct peer *p) {
 void broadcast_sync(const char *key, size_t key_len,
                     const void *value, size_t value_len,
                     uint64_t ts, uint64_t node_id) {
+    (void)node_id;  /* suprime warning de parâmetro não usado */
     struct dmmr_frame frame;
     memset(&frame, 0, sizeof(frame));
     frame.magic = htons(DMMR_MAGIC);
@@ -155,6 +159,16 @@ void broadcast_sync(const char *key, size_t key_len,
 }
 
 /* ============================================================
+ * Fechar o socket de cluster externamente (para liberar a porta)
+ * ============================================================ */
+void cluster_close_listener(void) {
+    if (cluster_listen_fd >= 0) {
+        close(cluster_listen_fd);
+        cluster_listen_fd = -1;
+    }
+}
+
+/* ============================================================
  * Fechar todas as conexões persistentes (chamado no shutdown)
  * ============================================================ */
 void close_peer_connections(void) {
@@ -169,6 +183,9 @@ void close_peer_connections(void) {
     pthread_mutex_unlock(&peers_mutex);
 }
 
+/* ============================================================
+ * Thread listener para conexões de cluster (peers)
+ * ============================================================ */
 void *cluster_listener(void *arg) {
     int port = *(int *) arg;
     int listen_fd = socket(AF_INET, SOCK_STREAM, 0);
@@ -186,17 +203,37 @@ void *cluster_listener(void *arg) {
     addr.sin_addr.s_addr = htonl(INADDR_ANY);
     addr.sin_port = htons(port);
 
-    if (bind(listen_fd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
-        perror("cluster_listener bind");
+    /* Tentativas com retry para bind */
+    int retries = 5;
+    while (retries > 0) {
+        if (bind(listen_fd, (struct sockaddr *)&addr, sizeof(addr)) == 0) {
+            break;
+        }
+        if (errno == EADDRINUSE) {
+            perror("cluster_listener bind (retrying)");
+            sleep(1);
+            retries--;
+        } else {
+            perror("cluster_listener bind");
+            close(listen_fd);
+            return NULL;
+        }
+    }
+    if (retries == 0) {
+        fprintf(stderr, "cluster_listener bind failed after retries\n");
         close(listen_fd);
         return NULL;
     }
+
     if (listen(listen_fd, 16) < 0) {
         perror("cluster_listener listen");
         close(listen_fd);
         return NULL;
     }
 
+    cluster_listen_fd = listen_fd;  /* armazena para fechamento externo */
+
+    /* Loop principal de accept */
     while (running) {
         struct sockaddr_in peer_addr;
         socklen_t peer_len = sizeof(peer_addr);
@@ -213,13 +250,14 @@ void *cluster_listener(void *arg) {
         uint16_t legacy_opcode = 0, legacy_key_len = 0;
         int rc = read_frame(peer_fd, &frame, &payload, &is_legacy, &legacy_opcode, &legacy_key_len);
         if (rc == 0 && !is_legacy) {
-            uint64_t source_node_id = (uint64_t) ntohl(peer_addr.sin_addr.s_addr) ^ ((uint64_t) ntohs(peer_addr.sin_port) << 32);
+            uint64_t source_node_id = (uint64_t) ntohl(peer_addr.sin_addr.s_addr) ^
+                                      ((uint64_t) ntohs(peer_addr.sin_port) << 32);
             struct dmmr_frame local_frame = frame;
             local_frame.flags = htons(FLAG_FROM_PEER);
             process_frame(peer_fd, &local_frame, payload, source_node_id, true);
         }
         if (payload) {
-            /* Payload vem do pool agora – liberar via container_of */
+            /* Payload vem do pool – liberar via container_of */
             struct payload_buf *pbuf = (struct payload_buf *)
                 ((uint8_t *)payload - __builtin_offsetof(struct payload_buf, data));
             release_payload_buf(pbuf);
@@ -228,5 +266,6 @@ void *cluster_listener(void *arg) {
     }
 
     close(listen_fd);
+    cluster_listen_fd = -1;
     return NULL;
 }

@@ -91,82 +91,47 @@ if (args.len > 0) {
     return NGX_DECLINED;
 }
 
-typedef struct {
-    int fd;
-    ngx_uint_t connected;
-    u_char addr[256];
-    size_t addr_len;
-} ngx_http_dmmr_cache_conn_t;
-
-static ngx_http_dmmr_cache_conn_t ngx_http_dmmr_cache_conn = {
-    -1, 0, {0}, 0
-};
-
-static void
-ngx_http_dmmr_cache_close_conn(ngx_http_dmmr_cache_conn_t *conn)
-{
-    if (conn->fd >= 0) {
-        close(conn->fd);
-        conn->fd = -1;
-    }
-    conn->connected = 0;
-    conn->addr_len = 0;
-}
-
-static ngx_int_t
-ngx_http_dmmr_cache_addr_matches(ngx_http_dmmr_cache_conn_t *conn, ngx_str_t *addr)
-{
-    return conn->connected
-           && conn->addr_len == (size_t) addr->len
-           && ngx_memcmp(conn->addr, addr->data, addr->len) == 0;
-}
-
-static ngx_int_t
-ngx_http_dmmr_cache_connect(ngx_http_request_t *r, ngx_str_t *cache_addr)
+/* Cria uma nova conexão com o cache, retorna fd ou -1 em caso de erro */
+static int
+ngx_http_dmmr_cache_connect_new(ngx_http_request_t *r, ngx_str_t *cache_addr)
 {
     struct timeval tv;
     struct addrinfo hints;
-    struct addrinfo *res;
-    struct addrinfo *rp;
+    struct addrinfo *res, *rp;
     struct sockaddr_un sun;
-    u_char *host_start;
-    u_char *host_end;
-    u_char *port_start;
-    u_char *path;
+    u_char *host_start, *host_end, *port_start, *path;
     size_t path_len;
-    ngx_str_t host;
-    ngx_str_t port;
-    char host_str[256];
-    char port_str[16];
-    char *addr_prefix;
-    int fd;
-    int rc;
-
-    if (ngx_http_dmmr_cache_addr_matches(&ngx_http_dmmr_cache_conn, cache_addr)) {
-        return NGX_OK;
-    }
-
-    ngx_http_dmmr_cache_close_conn(&ngx_http_dmmr_cache_conn);
+    ngx_str_t host, port;
+    char host_str[256], port_str[16];
+    int fd, rc;
 
     if (cache_addr->len == 0 || cache_addr->data == NULL) {
-        return NGX_ERROR;
+        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                      "dmmr: cache_addr is empty");
+        return -1;
     }
 
+    /* Unix domain socket */
     if (ngx_strncmp(cache_addr->data, "unix:", 5) == 0) {
         path = cache_addr->data + 5;
         path_len = (size_t) (cache_addr->len - 5);
 
         if (path_len == 0 || path_len >= sizeof(sun.sun_path)) {
-            return NGX_ERROR;
+            ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                          "dmmr: invalid unix socket path '%.*s'",
+                          (int)path_len, path);
+            return -1;
         }
 
         fd = socket(AF_UNIX, SOCK_STREAM, 0);
         if (fd < 0) {
-            return NGX_ERROR;
+            ngx_log_error(NGX_LOG_ERR, r->connection->log, errno,
+                          "dmmr: socket(AF_UNIX) failed");
+            return -1;
         }
 
-        tv.tv_sec = 0;
-        tv.tv_usec = 500000;
+        tv.tv_sec = 1;
+        tv.tv_usec = 0;
         setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, (const void *) &tv, sizeof(tv));
         setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, (const void *) &tv, sizeof(tv));
 
@@ -176,81 +141,97 @@ ngx_http_dmmr_cache_connect(ngx_http_request_t *r, ngx_str_t *cache_addr)
         sun.sun_path[path_len] = '\0';
 
         if (connect(fd, (struct sockaddr *) &sun, sizeof(sun)) < 0) {
+            ngx_log_error(NGX_LOG_ERR, r->connection->log, errno,
+                          "dmmr: connect to unix socket '%.*s' failed",
+                          (int)path_len, path);
             close(fd);
-            return NGX_ERROR;
-        }
-    } else {
-        addr_prefix = "tcp:";
-        host_start = cache_addr->data;
-        if (ngx_strncmp(cache_addr->data, addr_prefix, 4) == 0) {
-            host_start = cache_addr->data + 4;
+            return -1;
         }
 
-        host_end = cache_addr->data + cache_addr->len;
-        port_start = ngx_strlchr(host_start, host_end, ':');
-        if (port_start == NULL) {
-            return NGX_ERROR;
-        }
+        ngx_log_error(NGX_LOG_DEBUG, r->connection->log, 0,
+                      "dmmr: connected to unix socket '%.*s'",
+                      (int)path_len, path);
+        return fd;
+    }
 
-        host.data = host_start;
-        host.len = port_start - host_start;
-        port.data = port_start + 1;
-        port.len = host_end - (port_start + 1);
+    /* TCP socket */
+    host_start = cache_addr->data;
+    if (ngx_strncmp(cache_addr->data, "tcp:", 4) == 0) {
+        host_start = cache_addr->data + 4;
+    }
 
-        if (host.len == 0 || port.len == 0 || host.len >= sizeof(host_str) || port.len >= sizeof(port_str)) {
-            return NGX_ERROR;
-        }
+    host_end = cache_addr->data + cache_addr->len;
+    port_start = ngx_strlchr(host_start, host_end, ':');
+    if (port_start == NULL) {
+        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                      "dmmr: invalid TCP address '%.*s' (missing port)",
+                      (int)cache_addr->len, cache_addr->data);
+        return -1;
+    }
 
-        ngx_memcpy((u_char *) host_str, host.data, host.len);
-        host_str[host.len] = '\0';
-        ngx_memcpy((u_char *) port_str, port.data, port.len);
-        port_str[port.len] = '\0';
+    host.data = host_start;
+    host.len = port_start - host_start;
+    port.data = port_start + 1;
+    port.len = host_end - (port_start + 1);
 
-        fd = socket(AF_INET, SOCK_STREAM, 0);
-        if (fd < 0) {
-            return NGX_ERROR;
-        }
+    if (host.len == 0 || port.len == 0 ||
+        host.len >= sizeof(host_str) || port.len >= sizeof(port_str)) {
+        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                      "dmmr: invalid host or port in '%.*s'",
+                      (int)cache_addr->len, cache_addr->data);
+        return -1;
+    }
 
-        tv.tv_sec = 0;
-        tv.tv_usec = 500000;
-        setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, (const void *) &tv, sizeof(tv));
-        setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, (const void *) &tv, sizeof(tv));
+    ngx_memcpy((u_char *) host_str, host.data, host.len);
+    host_str[host.len] = '\0';
+    ngx_memcpy((u_char *) port_str, port.data, port.len);
+    port_str[port.len] = '\0';
 
-        ngx_memzero(&hints, sizeof(hints));
-        hints.ai_family = AF_UNSPEC;
-        hints.ai_socktype = SOCK_STREAM;
+    fd = socket(AF_INET, SOCK_STREAM, 0);
+    if (fd < 0) {
+        ngx_log_error(NGX_LOG_ERR, r->connection->log, errno,
+                      "dmmr: socket(AF_INET) failed");
+        return -1;
+    }
 
-        rc = getaddrinfo(host_str, port_str, &hints, &res);
-        if (rc != 0) {
-            close(fd);
-            return NGX_ERROR;
-        }
+    tv.tv_sec = 1;
+    tv.tv_usec = 0;
+    setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, (const void *) &tv, sizeof(tv));
+    setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, (const void *) &tv, sizeof(tv));
 
-        for (rp = res; rp != NULL; rp = rp->ai_next) {
-            if (connect(fd, rp->ai_addr, rp->ai_addrlen) == 0) {
-                break;
-            }
-        }
+    ngx_memzero(&hints, sizeof(hints));
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
 
-        freeaddrinfo(res);
-        if (rp == NULL) {
-            close(fd);
-            return NGX_ERROR;
+    rc = getaddrinfo(host_str, port_str, &hints, &res);
+    if (rc != 0) {
+        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                      "dmmr: getaddrinfo(%s:%s) failed: %s",
+                      host_str, port_str, gai_strerror(rc));
+        close(fd);
+        return -1;
+    }
+
+    for (rp = res; rp != NULL; rp = rp->ai_next) {
+        if (connect(fd, rp->ai_addr, rp->ai_addrlen) == 0) {
+            break;
         }
     }
 
-    ngx_http_dmmr_cache_conn.fd = fd;
-    ngx_http_dmmr_cache_conn.connected = 1;
-    ngx_http_dmmr_cache_conn.addr_len = cache_addr->len;
-    if (cache_addr->len > sizeof(ngx_http_dmmr_cache_conn.addr) - 1) {
-        ngx_http_dmmr_cache_conn.addr_len = sizeof(ngx_http_dmmr_cache_conn.addr) - 1;
+    freeaddrinfo(res);
+    if (rp == NULL) {
+        ngx_log_error(NGX_LOG_ERR, r->connection->log, errno,
+                      "dmmr: connect to %s:%s failed", host_str, port_str);
+        close(fd);
+        return -1;
     }
-    ngx_memcpy(ngx_http_dmmr_cache_conn.addr, cache_addr->data, ngx_http_dmmr_cache_conn.addr_len);
-    ngx_http_dmmr_cache_conn.addr[ngx_http_dmmr_cache_conn.addr_len] = '\0';
 
-    return NGX_OK;
+    ngx_log_error(NGX_LOG_DEBUG, r->connection->log, 0,
+                  "dmmr: connected to %s:%s", host_str, port_str);
+    return fd;
 }
 
+/* Envia requisição ao cache e retorna NGX_OK com user_info preenchido, ou NGX_DECLINED ou NGX_ERROR */
 static ngx_int_t
 ngx_http_dmmr_send_cache_request(ngx_http_request_t *r, ngx_str_t *api_key, ngx_str_t *user_info)
 {
@@ -268,11 +249,12 @@ ngx_http_dmmr_send_cache_request(ngx_http_request_t *r, ngx_str_t *api_key, ngx_
         uint32_t value_len;
         uint64_t timestamp;
     } frame;
-    size_t total = 0;
+    size_t total;
     ssize_t n;
     uint16_t status;
     uint32_t resp_len;
     int rc;
+    int fd = -1;
 
     kcf = ngx_http_get_module_loc_conf(r, ngx_http_dmmr_module);
     if (kcf == NULL) {
@@ -280,11 +262,10 @@ ngx_http_dmmr_send_cache_request(ngx_http_request_t *r, ngx_str_t *api_key, ngx_
     }
 
     cache_addr = kcf->cache_addr;
-    if (ngx_http_dmmr_cache_connect(r, &cache_addr) != NGX_OK) {
-        return NGX_ERROR;
-    }
 
     if (api_key->len > sizeof(req_buf) - sizeof(frame)) {
+        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                      "dmmr: API key too long (%uz)", api_key->len);
         return NGX_ERROR;
     }
 
@@ -301,61 +282,99 @@ ngx_http_dmmr_send_cache_request(ngx_http_request_t *r, ngx_str_t *api_key, ngx_
     ngx_memcpy(req_buf, &frame, sizeof(frame));
     ngx_memcpy(req_buf + sizeof(frame), api_key->data, api_key->len);
 
-    rc = send(ngx_http_dmmr_cache_conn.fd, (const void *) req_buf, sizeof(frame) + api_key->len, 0);
-    if (rc < 0) {
-        ngx_http_dmmr_cache_close_conn(&ngx_http_dmmr_cache_conn);
-        if (ngx_http_dmmr_cache_connect(r, &cache_addr) != NGX_OK) {
-            return NGX_ERROR;
+    /* Tenta no máximo 2 vezes */
+    for (int retry = 0; retry < 2; retry++) {
+        /* Conectar */
+        fd = ngx_http_dmmr_cache_connect_new(r, &cache_addr);
+        if (fd < 0) {
+            continue;
         }
 
-        rc = send(ngx_http_dmmr_cache_conn.fd, (const void *) req_buf, sizeof(frame) + api_key->len, 0);
+        /* Enviar requisição */
+        rc = send(fd, (const void *) req_buf, sizeof(frame) + api_key->len, 0);
         if (rc < 0) {
-            ngx_http_dmmr_cache_close_conn(&ngx_http_dmmr_cache_conn);
-            return NGX_ERROR;
+            ngx_log_error(NGX_LOG_ERR, r->connection->log, errno,
+                          "dmmr: send to cache failed");
+            close(fd);
+            continue;
         }
-    }
 
-    total = 0;
-    while (total < 8) {
-        n = recv(ngx_http_dmmr_cache_conn.fd, (char *) resp_buf + total, 8 - total, 0);
-        if (n <= 0) {
-            ngx_http_dmmr_cache_close_conn(&ngx_http_dmmr_cache_conn);
-            if (ngx_http_dmmr_cache_connect(r, &cache_addr) != NGX_OK) {
-                return NGX_ERROR;
+        /* Ler cabeçalho (8 bytes) */
+        total = 0;
+        while (total < 8) {
+            n = recv(fd, (char *) resp_buf + total, 8 - total, 0);
+            if (n <= 0) {
+                if (n == 0) {
+                    ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                                  "dmmr: cache connection closed during header read");
+                } else {
+                    ngx_log_error(NGX_LOG_ERR, r->connection->log, errno,
+                                  "dmmr: recv header failed");
+                }
+                break;
             }
-            return NGX_ERROR;
+            total += (size_t) n;
         }
-        total += (size_t) n;
-    }
-
-    status = ntohs(*(uint16_t *) resp_buf);
-    resp_len = ntohl(*(uint32_t *) (resp_buf + sizeof(uint16_t)));
-
-    if (resp_len > sizeof(resp_buf) - 8) {
-        ngx_http_dmmr_cache_close_conn(&ngx_http_dmmr_cache_conn);
-        return NGX_ERROR;
-    }
-
-    while (total < 8 + resp_len) {
-        n = recv(ngx_http_dmmr_cache_conn.fd, (char *) resp_buf + total, (size_t) (8 + resp_len - total), 0);
-        if (n <= 0) {
-            ngx_http_dmmr_cache_close_conn(&ngx_http_dmmr_cache_conn);
-            return NGX_ERROR;
+        if (total < 8) {
+            close(fd);
+            continue;
         }
-        total += (size_t) n;
-    }
 
-    if (status == DMMR_PROTO_STATUS_OK) {
-        payload = resp_buf + 8;
-        user_info->len = resp_len;
-        user_info->data = ngx_pnalloc(r->pool, user_info->len);
-        if (user_info->data) {
-            ngx_memcpy(user_info->data, payload, user_info->len);
+        status = ntohs(*(uint16_t *) resp_buf);
+        resp_len = ntohl(*(uint32_t *) (resp_buf + sizeof(uint16_t)));
+
+        if (resp_len > sizeof(resp_buf) - 8) {
+            ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                          "dmmr: response length too large (%uD)", resp_len);
+            close(fd);
+            continue;
         }
-        return NGX_OK;
+
+        /* Ler corpo */
+        while (total < 8 + resp_len) {
+            n = recv(fd, (char *) resp_buf + total, (size_t) (8 + resp_len - total), 0);
+            if (n <= 0) {
+                if (n == 0) {
+                    ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                                  "dmmr: cache connection closed during body read");
+                } else {
+                    ngx_log_error(NGX_LOG_ERR, r->connection->log, errno,
+                                  "dmmr: recv body failed");
+                }
+                break;
+            }
+            total += (size_t) n;
+        }
+        if (total < 8 + resp_len) {
+            close(fd);
+            continue;
+        }
+
+        close(fd);
+        fd = -1;
+
+        if (status == DMMR_PROTO_STATUS_OK) {
+            payload = resp_buf + 8;
+            user_info->len = resp_len;
+            user_info->data = ngx_pnalloc(r->pool, user_info->len);
+            if (user_info->data) {
+                ngx_memcpy(user_info->data, payload, user_info->len);
+            }
+            ngx_log_error(NGX_LOG_DEBUG, r->connection->log, 0,
+                          "dmmr: cache returned OK, user_info='%V'", user_info);
+            return NGX_OK;
+        } else {
+            ngx_log_error(NGX_LOG_DEBUG, r->connection->log, 0,
+                          "dmmr: cache returned status %d (not OK)", status);
+            return NGX_DECLINED;
+        }
     }
 
-    return NGX_DECLINED;
+    /* Fecha se ainda estiver aberto */
+    if (fd >= 0) close(fd);
+    ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                  "dmmr: all retries failed");
+    return NGX_ERROR;
 }
 
 static ngx_int_t
@@ -364,14 +383,13 @@ ngx_http_dmmr_verify_key_api(ngx_http_request_t *r, ngx_str_t *api_key, ngx_str_
     return ngx_http_dmmr_send_cache_request(r, api_key, user_info);
 }
 
-/* Estrutura para chave API */
+/* Estrutura para chave API (fallback estático) */
 typedef struct {
     ngx_str_t  key;
     ngx_str_t  user;
     ngx_str_t  permissions;
 } ngx_http_dmmr_api_key_t;
 
-/* Lista de chaves válidas (exemplo estático) */
 static ngx_http_dmmr_api_key_t valid_keys[] = {
     { ngx_string("123456"), ngx_string("user1"), ngx_string("read") },
     { ngx_string("abcdef"), ngx_string("user2"), ngx_string("read,write") },
@@ -386,7 +404,7 @@ ngx_http_dmmr_auth(ngx_http_request_t *r, ngx_http_dmmr_ctx_t *ctx)
     ngx_str_t user_info;
     ngx_str_t credential;
 
-    /* Rotas públicas (exemplo) */
+    /* Rotas públicas */
     if (r->uri.len >= 7 && ngx_strncmp(r->uri.data, "/public", 7) == 0) {
         ctx->authenticated = 1;
         return NGX_OK;
@@ -404,7 +422,7 @@ ngx_http_dmmr_auth(ngx_http_request_t *r, ngx_http_dmmr_ctx_t *ctx)
     }
     *api_key = credential;
 
-    /* Valida a chave via Cache Server (localhost:9080) */
+    /* Valida via Cache Server */
     if (ngx_http_dmmr_verify_key_api(r, api_key, &user_info) == NGX_OK) {
         ctx->authenticated = 1;
         ctx->auth_user = ngx_palloc(r->pool, sizeof(ngx_str_t));
@@ -412,11 +430,11 @@ ngx_http_dmmr_auth(ngx_http_request_t *r, ngx_http_dmmr_ctx_t *ctx)
             *ctx->auth_user = user_info;
         }
         ngx_log_error(NGX_LOG_INFO, r->connection->log, 0,
-                      "dmmr: authenticated user '%V' via http cache service", ctx->auth_user);
+                      "dmmr: authenticated user '%V' via cache service", ctx->auth_user);
         return NGX_OK;
     }
 
-    /* Fallback: Valida a chave estaticamente */
+    /* Fallback estático */
     for (i = 0; i < sizeof(valid_keys)/sizeof(valid_keys[0]); i++) {
         if (api_key->len == valid_keys[i].key.len &&
             ngx_strncmp(api_key->data, valid_keys[i].key.data, api_key->len) == 0) {

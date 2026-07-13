@@ -24,6 +24,8 @@
 
 #define TTL_DEFAULT (3600ULL * 1000000ULL)
 
+extern int cluster_listen_fd;
+
 /* ============================================================
  * Fila de controle (broadcast)  –  usa control_cmd_pooled do pool
  * ============================================================ */
@@ -478,10 +480,12 @@ int process_frame(int fd, struct dmmr_frame *frame, const uint8_t *payload,
         case OP_SET:
         case OP_SYNC: {
             DMMR_LOG_DEBUG("process_frame: %s key='%.*s', value_len=%u", (opcode == OP_SET ? "OP_SET" : "OP_SYNC"), (int)key_len, key, value_len);
+            /*
             if (value_len == 0) {
                 status = DMMR_PROTO_STATUS_ERROR;
                 break;
             }
+            */
             uint64_t ts_use = ts;
             uint64_t node_use = source_node_id;
             if (!from_peer) {
@@ -624,8 +628,6 @@ int read_frame(int fd, struct dmmr_frame *frame, uint8_t **payload,
  */
 static void release_payload_from_ptr(uint8_t *payload_ptr) {
     if (!payload_ptr) return;
-    /* O payload_ptr aponta para o campo 'data' dentro de um payload_buf.
-     * Calcula o offset para recuperar o ponteiro base da struct. */
     struct payload_buf *pbuf = (struct payload_buf *)
         ((uint8_t *)payload_ptr - offsetof(struct payload_buf, data));
     release_payload_buf(pbuf);
@@ -657,24 +659,32 @@ int process_legacy_request(int fd, uint16_t opcode, uint16_t key_len, const uint
 }
 
 void handle_client(int fd) {
-    struct dmmr_frame frame;
-    uint8_t *payload = NULL;
-    bool is_legacy = false;
-    uint16_t legacy_opcode = 0, legacy_key_len = 0;
+    while (1) {
+        struct dmmr_frame frame;
+        uint8_t *payload = NULL;
+        bool is_legacy = false;
+        uint16_t legacy_opcode = 0, legacy_key_len = 0;
 
-    int rc = read_frame(fd, &frame, &payload, &is_legacy, &legacy_opcode, &legacy_key_len);
-    if (rc == 0) {
+        int rc = read_frame(fd, &frame, &payload, &is_legacy, &legacy_opcode, &legacy_key_len);
+        if (rc < 0) {
+            /* erro ou conexão fechada */
+            break;
+        }
+
         if (is_legacy) {
             process_legacy_request(fd, legacy_opcode, legacy_key_len, payload);
         } else {
             process_frame(fd, &frame, payload, my_node_id, false);
         }
+
+        /* Libera o payload do pool após o processamento */
+        if (payload != NULL) {
+            release_payload_from_ptr(payload);
+        }
     }
-    /* Libera payload de volta ao pool (em vez de free) */
-    if (payload != NULL) release_payload_from_ptr(payload);
+
     close(fd);
 }
-
 /* ============================================================
  * enqueue_job / worker – usam pool estático de job_fd
  * ============================================================ */
@@ -1037,6 +1047,10 @@ while (running) {
     free(worker_threads);
 
     pthread_join(cluster_thread, NULL);
+    if (cluster_listen_fd >= 0) {
+        close(cluster_listen_fd);
+        cluster_listen_fd = -1;
+    }
 
     /* Fechar conexões persistentes de cluster */
     close_peer_connections();

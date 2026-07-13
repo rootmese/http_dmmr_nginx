@@ -19,6 +19,34 @@
 static ngx_str_t *ngx_http_dmmr_get_header_value(ngx_http_request_t *r,
                                                  const char *name);
 
+/* Função auxiliar para buscar cabeçalho */
+static ngx_str_t *
+ngx_http_dmmr_get_header_value(ngx_http_request_t *r, const char *name)
+{
+    ngx_list_part_t *part = &r->headers_in.headers.part;
+    ngx_table_elt_t *h = part->elts;
+    ngx_uint_t i;
+    size_t len = ngx_strlen(name);
+
+    for (;;) {
+        for (i = 0; i < part->nelts; i++) {
+            if (h[i].key.len == len &&
+                ngx_strncasecmp(h[i].key.data, (u_char *) name, len) == 0) {
+                return &h[i].value;
+            }
+        }
+
+        if (part->next == NULL) {
+            break;
+        }
+
+        part = part->next;
+        h = part->elts;
+    }
+
+    return NULL;
+}
+
 static uint64_t
 ngx_http_dmmr_htonll(uint64_t value)
 {
@@ -401,8 +429,9 @@ ngx_http_dmmr_auth(ngx_http_request_t *r, ngx_http_dmmr_ctx_t *ctx)
 {
     ngx_str_t *api_key = NULL;
     ngx_uint_t i;
-    ngx_str_t user_info;
+    ngx_str_t user_info = ngx_null_string;
     ngx_str_t credential;
+    ngx_int_t cache_rc;
 
     /* Rotas públicas */
     if (r->uri.len >= 7 && ngx_strncmp(r->uri.data, "/public", 7) == 0) {
@@ -423,7 +452,9 @@ ngx_http_dmmr_auth(ngx_http_request_t *r, ngx_http_dmmr_ctx_t *ctx)
     *api_key = credential;
 
     /* Valida via Cache Server */
-    if (ngx_http_dmmr_verify_key_api(r, api_key, &user_info) == NGX_OK) {
+    cache_rc = ngx_http_dmmr_verify_key_api(r, api_key, &user_info);
+
+    if (cache_rc == NGX_OK) {
         ctx->authenticated = 1;
         ctx->auth_user = ngx_palloc(r->pool, sizeof(ngx_str_t));
         if (ctx->auth_user) {
@@ -434,14 +465,24 @@ ngx_http_dmmr_auth(ngx_http_request_t *r, ngx_http_dmmr_ctx_t *ctx)
         return NGX_OK;
     }
 
-    /* Fallback estático */
+    /* Cache indisponível -> não usa fallback */
+    if (cache_rc == NGX_ERROR) {
+        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+                      "dmmr: authentication cache unavailable");
+        return NGX_HTTP_SERVICE_UNAVAILABLE;
+    }
+
+    /*
+     * cache_rc == NGX_DECLINED: cache respondeu que a chave não existe.
+     * Fallback estático (apenas para desenvolvimento/ambiente controlado).
+     */
     for (i = 0; i < sizeof(valid_keys)/sizeof(valid_keys[0]); i++) {
         if (api_key->len == valid_keys[i].key.len &&
             ngx_strncmp(api_key->data, valid_keys[i].key.data, api_key->len) == 0) {
             ctx->authenticated = 1;
             ctx->auth_user = &valid_keys[i].user;
             ngx_log_error(NGX_LOG_INFO, r->connection->log, 0,
-                          "dmmr: authenticated user '%V' (static)", ctx->auth_user);
+                          "dmmr: authenticated user '%V' (static fallback)", ctx->auth_user);
             return NGX_OK;
         }
     }
@@ -449,32 +490,4 @@ ngx_http_dmmr_auth(ngx_http_request_t *r, ngx_http_dmmr_ctx_t *ctx)
     ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
                   "dmmr: invalid API key '%.*s'", (int)api_key->len, api_key->data);
     return NGX_HTTP_FORBIDDEN;
-}
-
-static ngx_str_t *
-ngx_http_dmmr_get_header_value(ngx_http_request_t *r,
-                               const char *name)
-{
-    ngx_list_part_t *part = &r->headers_in.headers.part;
-    ngx_table_elt_t *h = part->elts;
-    ngx_uint_t i;
-    size_t len = ngx_strlen(name);
-
-    for (;;) {
-        for (i = 0; i < part->nelts; i++) {
-            if (h[i].key.len == len &&
-                ngx_strncasecmp(h[i].key.data, (u_char *) name, len) == 0) {
-                return &h[i].value;
-            }
-        }
-
-        if (part->next == NULL) {
-            break;
-        }
-
-        part = part->next;
-        h = part->elts;
-    }
-
-    return NULL;
 }

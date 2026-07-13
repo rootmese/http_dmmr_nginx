@@ -856,6 +856,7 @@ int main(int argc, char *argv[]) {
 
     signal(SIGINT, signal_handler);
     signal(SIGTERM, signal_handler);
+    signal(SIGPIPE, SIG_IGN);
 
     /* Inicializar pools de objetos (antes de qualquer uso) */
     if (init_pools() != 0) {

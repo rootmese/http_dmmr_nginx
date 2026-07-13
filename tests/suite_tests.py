@@ -435,13 +435,20 @@ class CacheManager:
             LOG.info('Stopping cache process...')
             try:
                 if os.name != 'nt':
-                    os.killpg(os.getpgid(self.proc.pid), signal.SIGINT)
+                    pgid = os.getpgid(self.proc.pid)
+                    os.killpg(pgid, signal.SIGTERM)
                 else:
                     self.proc.terminate()
                 self.proc.wait(timeout=CFG.PROCESS_TIMEOUT)
             except subprocess.TimeoutExpired:
                 LOG.warn('Cache did not stop gracefully — killing...')
-                self.proc.kill()
+                try:
+                    if os.name != 'nt':
+                        os.killpg(os.getpgid(self.proc.pid), signal.SIGKILL)
+                    else:
+                        self.proc.kill()
+                except ProcessLookupError:
+                    pass
                 self.proc.wait()
             LOG.ok('Cache process stopped.')
         self.proc = None
@@ -452,7 +459,8 @@ class CacheManager:
             except OSError:
                 pass
 
-        self._wait_port_free(CFG.CACHE_TCP_PORT, timeout=5)
+        if not self._wait_port_free(CFG.CACHE_TCP_PORT, timeout=10):
+            LOG.warn(f'TCP port {CFG.CACHE_TCP_PORT} still open after cache stop.')
 
     def dump_logs(self) -> str:
         parts = []
@@ -701,6 +709,10 @@ class DMMRTestSuite(BaseIntegrationTest):
                 label = ' '.join(args)
                 LOG.info(f'Testing mode: {label}')
                 self.cache_mgr.stop()
+                if not expect_tcp:
+                    self.assertTrue(
+                        self.cache_mgr._wait_port_free(CFG.CACHE_TCP_PORT, timeout=10),
+                        f'TCP port {CFG.CACHE_TCP_PORT} must be free before --unix-only test')
                 self.cache_mgr.start(args)
 
                 unix_ok = os.path.exists(CFG.CACHE_SOCK)
@@ -925,8 +937,8 @@ class DMMRTestSuite(BaseIntegrationTest):
             LOG.info(f'Testing authentication on port {port}...')
 
             resp = self.http.get(port)
-            self.assertNotIn(resp.status_code, (401, 403),
-                             f'Valid key should not be rejected (got {resp.status_code})')
+            self.assertEqual(resp.status_code, 200,
+                             f'Valid key should return 200 (got {resp.status_code})')
             LOG.ok(f'[:{port}] Valid API key → {resp.status_code}')
 
             resp = self.http.get(port, headers={'Authorization': 'Bearer invalid'})
@@ -956,6 +968,7 @@ class DMMRTestSuite(BaseIntegrationTest):
             LOG.info(f'Testing routing on port {port}...')
 
             resp = self.http.get(port, '/api/v1')
+            print("Body:", resp.text[:200])
             self.assertEqual(resp.status_code, 200,
                              f'Expected 200 for /api/v1, got {resp.status_code}')
             self.assertIn(b'Backend 8001', resp.content)
@@ -1203,8 +1216,8 @@ class DMMRTestSuite(BaseIntegrationTest):
             time.sleep(62)
 
             resp = requests.get(url, headers=self.http.auth_headers)
-            self.assertNotEqual(resp.status_code, 429,
-                                'Rate limit should have reset after window')
+            self.assertEqual(resp.status_code, 200,
+                             f'Expected 200 after rate window reset, got {resp.status_code}')
             LOG.ok(f'[:{port}] Rate limit reset → {resp.status_code}')
 
         self._test_on_both_ports(_test)

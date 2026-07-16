@@ -17,6 +17,7 @@
 #include <sys/un.h>
 #include <arpa/inet.h>
 #include <netinet/tcp.h>
+#include <sys/stat.h>
 #include <sys/queue.h>
 #include <time.h>
 #include <db.h>
@@ -809,10 +810,16 @@ int main(int argc, char *argv[]) {
     int listen_fds[2] = { -1, -1 };
     int listen_count = 0;
     int tcp_fd = -1, unix_fd = -1;
-    int cluster_port = CLUSTER_PORT;
+    int cache_port = dmmr_env_int("DMMR_CACHE_PORT", PORT, 1, 65535);
+    int cluster_port = dmmr_env_int("DMMR_CLUSTER_PORT", CLUSTER_PORT, 1, 65535);
+    const char *socket_path = dmmr_env_string("DMMR_SOCKET_PATH", SOCK_PATH);
+    const char *bind_address = dmmr_env_string("DMMR_BIND_ADDRESS", "127.0.0.1");
+    mode_t socket_mode = (mode_t) dmmr_env_mode("DMMR_SOCKET_MODE", 0666);
     pthread_t cluster_thread;
     pthread_t gc_thread;
     int daemon_mode = 0;  /* 0 = foreground, 1 = daemon */
+
+    worker_count = dmmr_env_int("DMMR_WORKERS", DEFAULT_WORKERS, 1, 1024);
 
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--unix") == 0) use_unix = true;
@@ -846,6 +853,10 @@ int main(int argc, char *argv[]) {
     }
 
     if (!use_unix && !use_tcp) use_unix = true;
+    if (use_unix && strlen(socket_path) >= sizeof(((struct sockaddr_un *) 0)->sun_path)) {
+        fprintf(stderr, "DMMR_SOCKET_PATH is too long: %s\n", socket_path);
+        return 1;
+    }
     if (my_node_id == 0) {
         my_node_id = (uint64_t) time(NULL) ^ ((uint64_t) getpid() << 32);
     }
@@ -904,12 +915,19 @@ int main(int argc, char *argv[]) {
             struct sockaddr_un addr;
             memset(&addr, 0, sizeof(addr));
             addr.sun_family = AF_UNIX;
-            strncpy(addr.sun_path, SOCK_PATH, sizeof(addr.sun_path) - 1);
-            unlink(SOCK_PATH);
+            strncpy(addr.sun_path, socket_path, sizeof(addr.sun_path) - 1);
+            unlink(socket_path);
             if (bind(unix_fd, (struct sockaddr *)&addr, sizeof(addr)) == 0 &&
                 listen(unix_fd, SOMAXCONN) == 0) {
-                listen_fds[listen_count++] = unix_fd;
-                printf("Unix socket: %s\n", SOCK_PATH);
+                if (chmod(socket_path, socket_mode) != 0) {
+                    perror("chmod unix socket");
+                    close(unix_fd);
+                    unlink(socket_path);
+                    unix_fd = -1;
+                } else {
+                    listen_fds[listen_count++] = unix_fd;
+                    printf("Unix socket: %s (mode %04o)\n", socket_path, socket_mode);
+                }
             } else {
                 perror("unix bind/listen");
                 close(unix_fd);
@@ -928,16 +946,22 @@ int main(int argc, char *argv[]) {
             struct sockaddr_in addr;
             memset(&addr, 0, sizeof(addr));
             addr.sin_family = AF_INET;
-            addr.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
-            addr.sin_port = htons(PORT);
-            if (bind(tcp_fd, (struct sockaddr *)&addr, sizeof(addr)) == 0 &&
-                listen(tcp_fd, SOMAXCONN) == 0) {
-                listen_fds[listen_count++] = tcp_fd;
-                printf("TCP socket: port %d\n", PORT);
-            } else {
-                perror("tcp bind/listen");
+            if (inet_pton(AF_INET, bind_address, &addr.sin_addr) != 1) {
+                fprintf(stderr, "Invalid DMMR_BIND_ADDRESS (IPv4 required): %s\n", bind_address);
                 close(tcp_fd);
                 tcp_fd = -1;
+            }
+            if (tcp_fd >= 0) {
+                addr.sin_port = htons((uint16_t) cache_port);
+                if (bind(tcp_fd, (struct sockaddr *)&addr, sizeof(addr)) == 0 &&
+                    listen(tcp_fd, SOMAXCONN) == 0) {
+                    listen_fds[listen_count++] = tcp_fd;
+                    printf("TCP socket: %s:%d\n", bind_address, cache_port);
+                } else {
+                    perror("tcp bind/listen");
+                    close(tcp_fd);
+                    tcp_fd = -1;
+                }
             }
         }
     }
@@ -1058,7 +1082,7 @@ while (running) {
 
     if (unix_fd >= 0) {
         close(unix_fd);
-        unlink(SOCK_PATH);
+        unlink(socket_path);
     }
     if (tcp_fd >= 0) close(tcp_fd);
 

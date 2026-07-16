@@ -1,0 +1,14 @@
+services:
+  dmmr-cache:
+    build: .
+    environment:
+      DMMR_BIND_ADDRESS: 0.0.0.0
+      DMMR_CACHE_PORT: 9080
+      DMMR_DB_PATH: /data/apikeys.db
+    ports:
+      - "9080:9080"
+    volumes:
+      - dmmr-cache-data:/data
+
+volumes:
+  dmmr-cache-data:

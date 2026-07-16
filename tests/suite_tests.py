@@ -54,7 +54,9 @@ class Config:
     CACHE_BIN: str = os.path.abspath(
         os.path.join(os.path.dirname(__file__), '..', 'http_dmmr_cache', 'dmmr_cache')
     )
-    CACHE_SOCK: str = '/tmp/dmmr_cache.sock'
+    # Deve acompanhar DMMR_SOCKET_PATH, usado pelo daemon quando executado
+    # fora do namespace /tmp do Nginx (por exemplo, systemd PrivateTmp).
+    CACHE_SOCK: str = os.environ.get('DMMR_SOCKET_PATH', '/tmp/dmmr_cache.sock')
 
     # Portas
     CACHE_TCP_PORT: int = 9080

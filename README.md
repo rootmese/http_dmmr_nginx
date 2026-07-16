@@ -1,6 +1,6 @@
 # Nginx DMMR API Gateway (Kong Alternative)
 
-[![Status](https://img.shields.io/badge/status-0.0.2--alpha-orange.svg)]()
+[![Status](https://img.shields.io/badge/status-0.1.0--beta-blue.svg)]()
 [![License](https://img.shields.io/badge/license-BSD--2--Clause-blue.svg)](LICENSE)
 
 A native C, high-performance API gateway module for Nginx, coupled with a distributed persistence cache layer powered by Berkeley DB. The system operates on a zero-malloc request path philosophy to guarantee low-latency, event-driven API gateway routing, authentication, and rate limiting directly within Nginx worker processes.
@@ -84,15 +84,70 @@ make debug
 
 Start the daemon binding to UNIX sockets, TCP, or both:
 ```bash
-# Run binding to unix domain socket only (/tmp/dmmr_cache.sock)
-./http_dmmr_cache --unix
+# Run binding to Unix socket only
+./dmmr_cache --unix
 
 # Run binding to TCP port only (127.0.0.1:9080)
-./http_dmmr_cache --tcp
+./dmmr_cache --tcp
 
 # Run binding to both TCP and Unix domain socket
-./http_dmmr_cache --both
+./dmmr_cache --both
 ```
+
+### Unix socket with systemd Nginx (WSL/Linux)
+
+When Nginx runs as a systemd service with `PrivateTmp=true`, it cannot access
+sockets created under the shell's `/tmp`. Use `/run/dmmr` instead. The cache,
+the test suite and the Nginx directive must use the same path.
+
+```bash
+sudo install -d -o "$USER" -g "$(id -gn)" -m 0777 /run/dmmr
+
+export DMMR_SOCKET_PATH=/run/dmmr/dmmr_cache.sock
+export DMMR_SOCKET_MODE=0666
+# 9081 is used by the second Nginx test server; avoid its cluster-port conflict.
+export DMMR_CLUSTER_PORT=9091
+
+cd tests
+python3 suite_tests.py
+```
+
+For the Nginx server that uses Unix sockets:
+
+```nginx
+dmmr_cache_addr unix:/run/dmmr/dmmr_cache.sock;
+```
+
+For production, use a shared group and permissions `2770` on `/run/dmmr` and
+`0660` for `DMMR_SOCKET_MODE`, rather than the permissive development settings
+above.
+
+### Container
+
+The cache can run as a standalone container. Its default container command is
+TCP-only, which avoids sharing a Unix socket between containers.
+
+```bash
+cd http_dmmr_cache
+docker compose up --build
+```
+
+It persists Berkeley DB data in the `dmmr-cache-data` volume and listens on
+`0.0.0.0:9080`. When Nginx runs in another container on the same Compose
+network, configure it with `dmmr_cache_addr tcp:dmmr-cache:9080;` rather than
+`unix:/tmp/dmmr_cache.sock`.
+
+The runtime settings may be overridden without rebuilding:
+
+```bash
+DMMR_BIND_ADDRESS=0.0.0.0 DMMR_CACHE_PORT=9080 \
+DMMR_DB_PATH=/data/apikeys.db DMMR_WORKERS=4 ./dmmr_cache --tcp
+```
+
+Supported variables are `DMMR_BIND_ADDRESS`, `DMMR_CACHE_PORT`,
+`DMMR_CLUSTER_PORT`, `DMMR_DB_PATH`, `DMMR_WORKERS`, `DMMR_SOCKET_PATH`, and
+`DMMR_SOCKET_MODE` (octal, for example `0660`). Command-line options override
+the worker count and cluster port settings.
 
 ---
 
@@ -184,8 +239,9 @@ http {
         location / {
             dmmr_enable on;
             
-            # Path to cache daemon
-            dmmr_cache_addr unix:/tmp/dmmr_cache.sock; # or tcp:127.0.0.1:9080
+            # Path to cache daemon. /run is suitable for a systemd-managed Nginx.
+            dmmr_cache_addr unix:/run/dmmr/dmmr_cache.sock;
+            # Or use TCP: dmmr_cache_addr tcp:127.0.0.1:9080;
             
             # Local Rate Limiting Configuration
             dmmr_rate_limit 120;

@@ -139,6 +139,10 @@ ngx_http_dmmr_cache_connect_new(ngx_http_request_t *r, ngx_str_t *cache_addr)
         return -1;
     }
 
+    ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+    "cache_addr len=%uz value='%V'",
+    cache_addr->len, cache_addr);
+
     /* Unix domain socket */
     if (ngx_strncmp(cache_addr->data, "unix:", 5) == 0) {
         path = cache_addr->data + 5;
@@ -151,12 +155,19 @@ ngx_http_dmmr_cache_connect_new(ngx_http_request_t *r, ngx_str_t *cache_addr)
             return -1;
         }
 
+        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+        "path len=%uz value='%*s'",
+        path_len, (int)path_len, path);
+
+        
         fd = socket(AF_UNIX, SOCK_STREAM, 0);
         if (fd < 0) {
             ngx_log_error(NGX_LOG_ERR, r->connection->log, errno,
                           "dmmr: socket(AF_UNIX) failed");
             return -1;
         }
+        ngx_log_error(NGX_LOG_ERR, r->connection->log, 0,
+              "socket() fd=%d errno=%d", fd, errno);
 
         tv.tv_sec = 1;
         tv.tv_usec = 0;
@@ -170,8 +181,8 @@ ngx_http_dmmr_cache_connect_new(ngx_http_request_t *r, ngx_str_t *cache_addr)
 
         if (connect(fd, (struct sockaddr *) &sun, sizeof(sun)) < 0) {
             ngx_log_error(NGX_LOG_ERR, r->connection->log, errno,
-                          "dmmr: connect to unix socket '%.*s' failed",
-                          (int)path_len, path);
+                          "dmmr: connect to unix socket '%*s' failed",
+                          (size_t) path_len, path);
             close(fd);
             return -1;
         }

@@ -1,0 +1,4 @@
+dmmr_cache
+*.o
+*.db
+*.zip

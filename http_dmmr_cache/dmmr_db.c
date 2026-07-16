@@ -14,7 +14,8 @@ int init_db(void) {
         fprintf(stderr, "db_create: %s\n", db_strerror(ret));
         return -1;
     }
-    if ((ret = dbp->open(dbp, NULL, DB_PATH, NULL, DB_BTREE, DB_CREATE | DB_THREAD, 0644)) != 0) {
+    if ((ret = dbp->open(dbp, NULL, dmmr_env_string("DMMR_DB_PATH", DB_PATH), NULL,
+                         DB_BTREE, DB_CREATE | DB_THREAD, 0644)) != 0) {
         dbp->err(dbp, ret, "Database open failed");
         return -1;
     }

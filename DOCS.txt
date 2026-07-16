@@ -12,37 +12,60 @@ Main components:
    - Uses the configured cache endpoint for lookups
 
 2. Cache daemon
-   - Exposes a small HTTP interface for key lookup/update/delete
-   - Supports Unix socket and TCP
+   - Exposes a custom binary protocol for key lookup/update/delete
+   - Supports Unix sockets and TCP
    - Persists data in Berkeley DB (apikeys.db)
 
 Cache address formats:
-- unix:/tmp/dmmr_cache.sock
+- unix:/run/dmmr/dmmr_cache.sock
 - tcp:127.0.0.1:9080
 
 Runtime behavior:
 - The Nginx module sends a request to the cache daemon when an API key is presented
-- The daemon returns 200 OK on success, or a failure status otherwise
+- The daemon returns a binary protocol status and optional payload
 - The module falls back to static keys if the cache lookup does not succeed
 
 Build and run:
 - cd http_dmmr_cache
 - make
-- ./http_dmmr_cache --unix
-- ./http_dmmr_cache --tcp
-- ./http_dmmr_cache --both
+- ./dmmr_cache --unix
+- ./dmmr_cache --tcp
+- ./dmmr_cache --both
 
 Example curl commands:
 - Unix socket:
-  curl --unix-socket /tmp/dmmr_cache.sock http://localhost/keys/abc123
+  The cache protocol is binary; use the project's Python tests/client rather
+  than curl.
 - TCP:
-  curl http://127.0.0.1:9080/keys/abc123
+  The cache protocol is binary; use the project's Python tests/client rather
+  than curl.
 
 Configuration example:
 location / {
     dmmr_enable on;
-    dmmr_cache_addr unix:/tmp/dmmr_cache.sock;
+    dmmr_cache_addr unix:/run/dmmr/dmmr_cache.sock;
 }
+
+WSL/Linux with systemd Nginx:
+- Some Nginx services use PrivateTmp=true, which isolates /tmp from the
+  daemon launched in a shell. In that case, /tmp/dmmr_cache.sock is not visible
+  to Nginx and produces 503 responses.
+- Create a shared runtime directory and configure all processes with the same
+  socket path:
+  sudo install -d -o "$USER" -g "$(id -gn)" -m 0777 /run/dmmr
+  export DMMR_SOCKET_PATH=/run/dmmr/dmmr_cache.sock
+  export DMMR_SOCKET_MODE=0666
+- The cache cluster listener defaults to port 9081. If Nginx also listens on
+  9081, avoid the collision with: export DMMR_CLUSTER_PORT=9091
+
+Runtime environment variables:
+- DMMR_BIND_ADDRESS: IPv4 address for the cache TCP listener (default 127.0.0.1)
+- DMMR_CACHE_PORT: cache TCP port (default 9080)
+- DMMR_CLUSTER_PORT: cluster listener port (default 9081)
+- DMMR_DB_PATH: Berkeley DB file path (default ./apikeys.db)
+- DMMR_WORKERS: number of cache workers (default 4)
+- DMMR_SOCKET_PATH: Unix socket path (default /tmp/dmmr_cache.sock)
+- DMMR_SOCKET_MODE: Unix socket mode in octal, for example 0660 or 0666
 
 Implementation notes:
 - Berkeley DB is used as the persistence layer;

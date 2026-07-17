@@ -10,51 +10,73 @@
 - TCP transport
 - Unix Socket transport
 - Configurable cache address via `dmmr_cache_addr`
-- Persistent connection reuse
-- Automatic reconnection
+- Retry-based cache reconnection
 - API Key authentication
 - Dynamic routing
 - Rate limiting
+
+> Status note: persistent connection reuse currently exists for cluster peers.
+> The Nginx module opens a cache connection per request and closes it after the
+> response; persistent cache connections in Nginx remain planned work.
 
 ---
 
 # Phase 1 — Stabilization (Highest Priority)
 
+Validation baseline: the `0.1.0-beta` integration suite completed 16 tests and
+112 checks with no failures. Items below describe implementation status, not
+only test coverage. The beta retains synchronous cache I/O with bounded
+timeouts and retry; the event-driven replacement is the first priority after
+the beta release.
+
 ## Memory Safety
 
-- Eliminate buffer overflow risks
-- Validate all packet lengths
-- Strict bounds checking
-- Safe string termination
+- [x] Validate modern-frame key and value lengths against `MAX_KEY_LEN` and
+  `MAX_VALUE_LEN` before reading the payload.
+- [x] Bound Nginx request and response buffers before copying data.
+- [x] Reject invalid modern frames and oversized payload declarations.
+- [x] Check Unix socket path length before copying it into `sockaddr_un`.
+- [ ] Audit every legacy-protocol and cluster-path field with explicit limits
+  and add focused regression tests for each rejection path.
 
 ---
 
 ## Binary Protocol Robustness
 
-- Handle partial `recv()`
-- Handle partial `send()`
-- Correct header parsing
-- Correct payload length handling
-- Protect against malformed packets
-- Gracefully reject invalid frames
-- Never crash on malformed input
+- [x] Cache daemon handles partial `recv()` and partial `send()` through
+  `recv_full()` and `send_full()`.
+- [x] Nginx reads response headers and bodies in loops, handling partial
+  `recv()` results.
+- [x] Modern-frame header parsing and payload-length validation are covered by
+  direct protocol and malformed-payload integration tests.
+- [x] Invalid opcodes and malformed frames are rejected without crashing the
+  cache daemon.
+- [x] Nginx sends complete cache requests through a full-write loop that
+  handles partial sends and `EINTR`.
+- [ ] Add automated tests that deliberately split both requests and responses
+  across multiple writes.
 
 ---
 
 ## Nginx Module Stability
 
-- Validate persistent sockets before reuse
-- Improve reconnection logic
-- Remove blocking operations from the Nginx worker context
-- Prepare an event-driven communication layer
+- [x] Retry a failed cache connection once and return `503` when the cache is
+  unavailable.
+- [x] Use one-second socket send/receive timeouts to bound blocking failures.
+- [ ] Implement and validate persistent cache sockets before reuse in Nginx.
+- [ ] **Next-release priority:** replace synchronous `connect()`, `send()` and
+  `recv()` calls in the Nginx request path with Nginx event-driven I/O.
+- [ ] Add connection idle timeout, health checking and reconnection telemetry.
 
 ---
 
 ## Authentication
 
-- Remove static fallback authentication
-- Externalize credentials
-- Add optional shared secret between Nginx module and daemon
+- [x] Validate API keys through the cache daemon backed by Berkeley DB.
+- [ ] Remove the development-only static fallback keys from the Nginx module.
+- [ ] Externalize credential and authorization metadata from source code.
+- [ ] Add an optional shared secret between the Nginx module and cache daemon.
+- [ ] Add key rotation, secret-rotation and authorization regression tests.
 
 ---
 

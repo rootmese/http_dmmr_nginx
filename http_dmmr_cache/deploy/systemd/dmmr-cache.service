@@ -1,0 +1,31 @@
+[Unit]
+Description=DMMR Cache daemon
+Wants=network-online.target
+After=network-online.target
+Before=nginx.service
+
+[Service]
+Type=simple
+User=nginx
+Group=nginx
+WorkingDirectory=/var/lib/dmmr
+Environment=DMMR_SOCKET_PATH=/run/dmmr/dmmr_cache.sock
+Environment=DMMR_SOCKET_MODE=0660
+Environment=DMMR_CLUSTER_PORT=9091
+EnvironmentFile=-/etc/dmmr/dmmr-cache.env
+ExecStart=/usr/local/bin/dmmr_cache --both
+Restart=on-failure
+RestartSec=2s
+
+RuntimeDirectory=dmmr
+RuntimeDirectoryMode=0750
+StateDirectory=dmmr
+StateDirectoryMode=0750
+UMask=0007
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target

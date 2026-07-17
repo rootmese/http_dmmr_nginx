@@ -14,7 +14,7 @@ static pthread_mutex_t payload_mutex = PTHREAD_MUTEX_INITIALIZER;
 struct payload_buf *get_payload_buf(void) {
     pthread_mutex_lock(&payload_mutex);
     register struct payload_buf *p = payload_pool;
-    register struct payload_buf *p1 = payload_pool + payload_pool_size;
+    register struct payload_buf *p1 = payload_pool + payload_pool_count;
     for (; p < p1; ++p) {
         if (!(p->in_use)) {
             p->in_use = 1;
@@ -46,8 +46,7 @@ struct payload_buf *get_payload_buf(void) {
 void release_payload_buf(struct payload_buf *p) {
     if (p) {
         pthread_mutex_lock(&payload_mutex);
-        p->in_use = 0;
-        p->len = 0;
+        memset(p, 0, sizeof(*p));
         pthread_mutex_unlock(&payload_mutex);
     }
 }
@@ -63,7 +62,7 @@ static pthread_mutex_t job_mutex = PTHREAD_MUTEX_INITIALIZER;
 struct job_pool_entry *get_job_entry(void) {
     pthread_mutex_lock(&job_mutex);
     register struct job_pool_entry *p = job_pool;
-    register struct job_pool_entry *p1 = job_pool + job_pool_size;
+    register struct job_pool_entry *p1 = job_pool + job_pool_count;
     for (; p < p1; ++p) {
         if (!(p->in_use)) {
             p->in_use = 1;
@@ -95,8 +94,7 @@ struct job_pool_entry *get_job_entry(void) {
 void release_job_entry(struct job_pool_entry *p) {
     if (p) {
         pthread_mutex_lock(&job_mutex);
-        p->in_use = 0;
-        p->fd = -1;
+        memset(p, 0, sizeof(*p));
         pthread_mutex_unlock(&job_mutex);
     }
 }
@@ -112,7 +110,7 @@ static pthread_mutex_t cmd_pool_mutex = PTHREAD_MUTEX_INITIALIZER;
 struct control_cmd_pooled *get_control_cmd(void) {
     pthread_mutex_lock(&cmd_pool_mutex);
     register struct control_cmd_pooled *p = cmd_pool;
-    register struct control_cmd_pooled *p1 = cmd_pool + cmd_pool_size;
+    register struct control_cmd_pooled *p1 = cmd_pool + cmd_pool_count;
     for (; p < p1; ++p) {
         if (!(p->in_use)) {
             p->in_use = 1;
@@ -134,7 +132,9 @@ struct control_cmd_pooled *get_control_cmd(void) {
     }
 
     struct control_cmd_pooled *ret = cmd_pool + cmd_pool_count++;
+    memset(ret, 0, sizeof(*ret));
     ret->in_use = 1;
+    ret->value = ret->value_data;
     pthread_mutex_unlock(&cmd_pool_mutex);
     return ret;
 }
@@ -142,10 +142,7 @@ struct control_cmd_pooled *get_control_cmd(void) {
 void release_control_cmd(struct control_cmd_pooled *p) {
     if (p) {
         pthread_mutex_lock(&cmd_pool_mutex);
-        p->in_use = 0;
-        p->value = NULL;
-        p->value_len = 0;
-        p->key_len = 0;
+        memset(p, 0, sizeof(*p));
         pthread_mutex_unlock(&cmd_pool_mutex);
     }
 }
@@ -161,7 +158,7 @@ static pthread_mutex_t del_pool_mutex = PTHREAD_MUTEX_INITIALIZER;
 struct delete_entry *get_delete_entry(void) {
     pthread_mutex_lock(&del_pool_mutex);
     register struct delete_entry *p = del_pool;
-    register struct delete_entry *p1 = del_pool + del_pool_size;
+    register struct delete_entry *p1 = del_pool + del_pool_count;
     for (; p < p1; ++p) {
         if (!(p->in_use)) {
             p->in_use = 1;
@@ -191,8 +188,7 @@ struct delete_entry *get_delete_entry(void) {
 void release_delete_entry(struct delete_entry *p) {
     if (p) {
         pthread_mutex_lock(&del_pool_mutex);
-        p->in_use = 0;
-        p->key_len = 0;
+        memset(p, 0, sizeof(*p));
         pthread_mutex_unlock(&del_pool_mutex);
     }
 }
@@ -237,10 +233,25 @@ int init_pools(void) {
 }
 
 void destroy_pools(void) {
-    free(payload_pool);   payload_pool = NULL;
-    free(job_pool);       job_pool = NULL;
-    free(cmd_pool);       cmd_pool = NULL;
-    free(del_pool);       del_pool = NULL;
+    free(payload_pool);
+    payload_pool = NULL;
+    payload_pool_size = 0;
+    payload_pool_count = 0;
+
+    free(job_pool);
+    job_pool = NULL;
+    job_pool_size = 0;
+    job_pool_count = 0;
+
+    free(cmd_pool);
+    cmd_pool = NULL;
+    cmd_pool_size = 0;
+    cmd_pool_count = 0;
+
+    free(del_pool);
+    del_pool = NULL;
+    del_pool_size = 0;
+    del_pool_count = 0;
 
     pthread_mutex_destroy(&payload_mutex);
     pthread_mutex_destroy(&job_mutex);

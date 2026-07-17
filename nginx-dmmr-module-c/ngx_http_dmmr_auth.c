@@ -19,6 +19,35 @@
 static ngx_str_t *ngx_http_dmmr_get_header_value(ngx_http_request_t *r,
                                                  const char *name);
 
+/* Sends the complete frame, retrying interrupted and partial writes. */
+static ssize_t ngx_http_dmmr_send_full(int fd, const void *buf, size_t len);
+
+static ssize_t
+ngx_http_dmmr_send_full(int fd, const void *buf, size_t len)
+{
+    size_t sent = 0;
+    ssize_t n;
+
+    while (sent < len) {
+        n = send(fd, (const u_char *) buf + sent, len - sent, 0);
+        if (n > 0) {
+            sent += (size_t) n;
+            continue;
+        }
+
+        if (n < 0 && errno == EINTR) {
+            continue;
+        }
+
+        if (n == 0) {
+            errno = EPIPE;
+        }
+        return -1;
+    }
+
+    return (ssize_t) sent;
+}
+
 /* Função auxiliar para buscar cabeçalho */
 static ngx_str_t *
 ngx_http_dmmr_get_header_value(ngx_http_request_t *r, const char *name)
@@ -292,7 +321,7 @@ ngx_http_dmmr_send_cache_request(ngx_http_request_t *r, ngx_str_t *api_key, ngx_
     ssize_t n;
     uint16_t status;
     uint32_t resp_len;
-    int rc;
+    ssize_t sent;
     int fd = -1;
 
     kcf = ngx_http_get_module_loc_conf(r, ngx_http_dmmr_module);
@@ -330,8 +359,8 @@ ngx_http_dmmr_send_cache_request(ngx_http_request_t *r, ngx_str_t *api_key, ngx_
         }
 
         /* Enviar requisição */
-        rc = send(fd, (const void *) req_buf, sizeof(frame) + api_key->len, 0);
-        if (rc < 0) {
+        sent = ngx_http_dmmr_send_full(fd, req_buf, sizeof(frame) + api_key->len);
+        if (sent < 0) {
             ngx_log_error(NGX_LOG_ERR, r->connection->log, errno,
                           "dmmr: send to cache failed");
             close(fd);

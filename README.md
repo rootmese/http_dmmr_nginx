@@ -5,6 +5,11 @@
 
 A native C, high-performance API gateway module for Nginx, coupled with a distributed persistence cache layer powered by Berkeley DB. The system operates on a zero-malloc request path philosophy to guarantee low-latency, event-driven API gateway routing, authentication, and rate limiting directly within Nginx worker processes.
 
+> **0.1.0-beta:** the complete integration suite passes (16 tests / 112 checks).
+> Cache authentication currently uses synchronous socket I/O with one-second
+> timeouts and one retry. Non-blocking, event-driven cache I/O is the highest
+> priority for the next release; it is not part of this beta.
+
 ---
 
 ## 🗺️ System Architecture
@@ -121,6 +126,38 @@ dmmr_cache_addr unix:/run/dmmr/dmmr_cache.sock;
 For production, use a shared group and permissions `2770` on `/run/dmmr` and
 `0660` for `DMMR_SOCKET_MODE`, rather than the permissive development settings
 above.
+
+### systemd service
+
+The repository includes a service unit that starts the cache automatically,
+restarts it after a failure, and creates the runtime and state directories. It
+runs as the `nginx` user so Nginx can access the Unix socket without a separate
+group configuration.
+
+After building `dmmr_cache`, install and enable it with:
+
+```bash
+sudo install -m 0755 http_dmmr_cache/dmmr_cache /usr/local/bin/dmmr_cache
+sudo install -D -m 0644 http_dmmr_cache/deploy/systemd/dmmr-cache.service \
+  /etc/systemd/system/dmmr-cache.service
+sudo install -D -m 0644 http_dmmr_cache/deploy/systemd/dmmr-cache.env.example \
+  /etc/dmmr/dmmr-cache.env
+sudo install -D -m 0644 http_dmmr_cache/deploy/systemd/nginx-dmmr-cache.conf \
+  /etc/systemd/system/nginx.service.d/dmmr-cache.conf
+sudo systemctl daemon-reload
+sudo systemctl enable --now dmmr-cache.service
+sudo systemctl restart nginx.service
+```
+
+Use this cache address in Nginx:
+
+```nginx
+dmmr_cache_addr unix:/run/dmmr/dmmr_cache.sock;
+```
+
+The `nginx-dmmr-cache.conf` drop-in makes systemd start the cache before Nginx.
+Adjust `/etc/dmmr/dmmr-cache.env` for ports, workers and database path, then
+restart the service with `sudo systemctl restart dmmr-cache`.
 
 ### Container
 

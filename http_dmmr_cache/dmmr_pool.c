@@ -1,42 +1,38 @@
 #include "dmmr_pool.h"
 #include <stdlib.h>
 #include <string.h>
-#include <stdio.h>
 
-/* ============================================================
- * Pool de payload_buf
- * ============================================================ */
-static struct payload_buf *payload_pool = NULL;
-static unsigned payload_pool_size = 0;
-static unsigned payload_pool_count = 0;
+/* Chunks keep allocated entries at stable addresses; TAILQs track free slots. */
+
+struct payload_chunk {
+    struct payload_buf entries[POOL_INITIAL_SIZE];
+    struct payload_chunk *next;
+};
+TAILQ_HEAD(payload_free_list, payload_buf);
+static struct payload_chunk *payload_chunks = NULL;
+static struct payload_free_list payload_free = TAILQ_HEAD_INITIALIZER(payload_free);
 static pthread_mutex_t payload_mutex = PTHREAD_MUTEX_INITIALIZER;
 
+static int add_payload_chunk(void) {
+    struct payload_chunk *chunk = calloc(1, sizeof(*chunk));
+    unsigned i;
+    if (chunk == NULL) return -1;
+    chunk->next = payload_chunks;
+    payload_chunks = chunk;
+    for (i = 0; i < POOL_INITIAL_SIZE; ++i)
+        TAILQ_INSERT_TAIL(&payload_free, &chunk->entries[i], free_entries);
+    return 0;
+}
+
 struct payload_buf *get_payload_buf(void) {
+    struct payload_buf *ret;
     pthread_mutex_lock(&payload_mutex);
-    register struct payload_buf *p = payload_pool;
-    register struct payload_buf *p1 = payload_pool + payload_pool_count;
-    for (; p < p1; ++p) {
-        if (!(p->in_use)) {
-            p->in_use = 1;
-            p->len = 0;
-            pthread_mutex_unlock(&payload_mutex);
-            return p;
-        }
+    if (TAILQ_EMPTY(&payload_free) && add_payload_chunk() != 0) {
+        pthread_mutex_unlock(&payload_mutex);
+        return NULL;
     }
-
-    if (payload_pool_count >= payload_pool_size) {
-        unsigned new_size = (payload_pool_size == 0) ? POOL_INITIAL_SIZE : (payload_pool_size * 2);
-        struct payload_buf *tmp = realloc(payload_pool, new_size * sizeof(struct payload_buf));
-        if (!tmp) {
-            pthread_mutex_unlock(&payload_mutex);
-            return NULL;
-        }
-        memset(tmp + payload_pool_size, 0, (new_size - payload_pool_size) * sizeof(struct payload_buf));
-        payload_pool = tmp;
-        payload_pool_size = new_size;
-    }
-
-    struct payload_buf *ret = payload_pool + payload_pool_count++;
+    ret = TAILQ_FIRST(&payload_free);
+    TAILQ_REMOVE(&payload_free, ret, free_entries);
     ret->in_use = 1;
     ret->len = 0;
     pthread_mutex_unlock(&payload_mutex);
@@ -47,44 +43,40 @@ void release_payload_buf(struct payload_buf *p) {
     if (p) {
         pthread_mutex_lock(&payload_mutex);
         memset(p, 0, sizeof(*p));
+        TAILQ_INSERT_TAIL(&payload_free, p, free_entries);
         pthread_mutex_unlock(&payload_mutex);
     }
 }
 
-/* ============================================================
- * Pool de job_pool_entry
- * ============================================================ */
-static struct job_pool_entry *job_pool = NULL;
-static unsigned job_pool_size = 0;
-static unsigned job_pool_count = 0;
+struct job_chunk {
+    struct job_pool_entry entries[POOL_INITIAL_SIZE];
+    struct job_chunk *next;
+};
+TAILQ_HEAD(job_free_list, job_pool_entry);
+static struct job_chunk *job_chunks = NULL;
+static struct job_free_list job_free = TAILQ_HEAD_INITIALIZER(job_free);
 static pthread_mutex_t job_mutex = PTHREAD_MUTEX_INITIALIZER;
 
+static int add_job_chunk(void) {
+    struct job_chunk *chunk = calloc(1, sizeof(*chunk));
+    unsigned i;
+    if (chunk == NULL) return -1;
+    chunk->next = job_chunks;
+    job_chunks = chunk;
+    for (i = 0; i < POOL_INITIAL_SIZE; ++i)
+        TAILQ_INSERT_TAIL(&job_free, &chunk->entries[i], free_entries);
+    return 0;
+}
+
 struct job_pool_entry *get_job_entry(void) {
+    struct job_pool_entry *ret;
     pthread_mutex_lock(&job_mutex);
-    register struct job_pool_entry *p = job_pool;
-    register struct job_pool_entry *p1 = job_pool + job_pool_count;
-    for (; p < p1; ++p) {
-        if (!(p->in_use)) {
-            p->in_use = 1;
-            p->fd = -1;
-            pthread_mutex_unlock(&job_mutex);
-            return p;
-        }
+    if (TAILQ_EMPTY(&job_free) && add_job_chunk() != 0) {
+        pthread_mutex_unlock(&job_mutex);
+        return NULL;
     }
-
-    if (job_pool_count >= job_pool_size) {
-        unsigned new_size = (job_pool_size == 0) ? POOL_INITIAL_SIZE : (job_pool_size * 2);
-        struct job_pool_entry *tmp = realloc(job_pool, new_size * sizeof(struct job_pool_entry));
-        if (!tmp) {
-            pthread_mutex_unlock(&job_mutex);
-            return NULL;
-        }
-        memset(tmp + job_pool_size, 0, (new_size - job_pool_size) * sizeof(struct job_pool_entry));
-        job_pool = tmp;
-        job_pool_size = new_size;
-    }
-
-    struct job_pool_entry *ret = job_pool + job_pool_count++;
+    ret = TAILQ_FIRST(&job_free);
+    TAILQ_REMOVE(&job_free, ret, free_entries);
     ret->in_use = 1;
     ret->fd = -1;
     pthread_mutex_unlock(&job_mutex);
@@ -95,43 +87,40 @@ void release_job_entry(struct job_pool_entry *p) {
     if (p) {
         pthread_mutex_lock(&job_mutex);
         memset(p, 0, sizeof(*p));
+        TAILQ_INSERT_TAIL(&job_free, p, free_entries);
         pthread_mutex_unlock(&job_mutex);
     }
 }
 
-/* ============================================================
- * Pool de control_cmd_pooled
- * ============================================================ */
-static struct control_cmd_pooled *cmd_pool = NULL;
-static unsigned cmd_pool_size = 0;
-static unsigned cmd_pool_count = 0;
+struct cmd_chunk {
+    struct control_cmd_pooled entries[POOL_INITIAL_SIZE];
+    struct cmd_chunk *next;
+};
+TAILQ_HEAD(cmd_free_list, control_cmd_pooled);
+static struct cmd_chunk *cmd_chunks = NULL;
+static struct cmd_free_list cmd_free = TAILQ_HEAD_INITIALIZER(cmd_free);
 static pthread_mutex_t cmd_pool_mutex = PTHREAD_MUTEX_INITIALIZER;
 
+static int add_cmd_chunk(void) {
+    struct cmd_chunk *chunk = calloc(1, sizeof(*chunk));
+    unsigned i;
+    if (chunk == NULL) return -1;
+    chunk->next = cmd_chunks;
+    cmd_chunks = chunk;
+    for (i = 0; i < POOL_INITIAL_SIZE; ++i)
+        TAILQ_INSERT_TAIL(&cmd_free, &chunk->entries[i], entries);
+    return 0;
+}
+
 struct control_cmd_pooled *get_control_cmd(void) {
+    struct control_cmd_pooled *ret;
     pthread_mutex_lock(&cmd_pool_mutex);
-    register struct control_cmd_pooled *p = cmd_pool;
-    register struct control_cmd_pooled *p1 = cmd_pool + cmd_pool_count;
-    for (; p < p1; ++p) {
-        if (!(p->in_use)) {
-            p->in_use = 1;
-            pthread_mutex_unlock(&cmd_pool_mutex);
-            return p;
-        }
+    if (TAILQ_EMPTY(&cmd_free) && add_cmd_chunk() != 0) {
+        pthread_mutex_unlock(&cmd_pool_mutex);
+        return NULL;
     }
-
-    if (cmd_pool_count >= cmd_pool_size) {
-        unsigned new_size = (cmd_pool_size == 0) ? POOL_INITIAL_SIZE : (cmd_pool_size * 2);
-        struct control_cmd_pooled *tmp = realloc(cmd_pool, new_size * sizeof(struct control_cmd_pooled));
-        if (!tmp) {
-            pthread_mutex_unlock(&cmd_pool_mutex);
-            return NULL;
-        }
-        memset(tmp + cmd_pool_size, 0, (new_size - cmd_pool_size) * sizeof(struct control_cmd_pooled));
-        cmd_pool = tmp;
-        cmd_pool_size = new_size;
-    }
-
-    struct control_cmd_pooled *ret = cmd_pool + cmd_pool_count++;
+    ret = TAILQ_FIRST(&cmd_free);
+    TAILQ_REMOVE(&cmd_free, ret, entries);
     memset(ret, 0, sizeof(*ret));
     ret->in_use = 1;
     ret->value = ret->value_data;
@@ -143,43 +132,40 @@ void release_control_cmd(struct control_cmd_pooled *p) {
     if (p) {
         pthread_mutex_lock(&cmd_pool_mutex);
         memset(p, 0, sizeof(*p));
+        TAILQ_INSERT_TAIL(&cmd_free, p, entries);
         pthread_mutex_unlock(&cmd_pool_mutex);
     }
 }
 
-/* ============================================================
- * Pool de delete_entry (Garbage Collector)
- * ============================================================ */
-static struct delete_entry *del_pool = NULL;
-static unsigned del_pool_size = 0;
-static unsigned del_pool_count = 0;
+struct delete_chunk {
+    struct delete_entry entries[POOL_INITIAL_SIZE];
+    struct delete_chunk *next;
+};
+TAILQ_HEAD(delete_free_list, delete_entry);
+static struct delete_chunk *del_chunks = NULL;
+static struct delete_free_list del_free = TAILQ_HEAD_INITIALIZER(del_free);
 static pthread_mutex_t del_pool_mutex = PTHREAD_MUTEX_INITIALIZER;
 
+static int add_delete_chunk(void) {
+    struct delete_chunk *chunk = calloc(1, sizeof(*chunk));
+    unsigned i;
+    if (chunk == NULL) return -1;
+    chunk->next = del_chunks;
+    del_chunks = chunk;
+    for (i = 0; i < POOL_INITIAL_SIZE; ++i)
+        TAILQ_INSERT_TAIL(&del_free, &chunk->entries[i], entries);
+    return 0;
+}
+
 struct delete_entry *get_delete_entry(void) {
+    struct delete_entry *ret;
     pthread_mutex_lock(&del_pool_mutex);
-    register struct delete_entry *p = del_pool;
-    register struct delete_entry *p1 = del_pool + del_pool_count;
-    for (; p < p1; ++p) {
-        if (!(p->in_use)) {
-            p->in_use = 1;
-            pthread_mutex_unlock(&del_pool_mutex);
-            return p;
-        }
+    if (TAILQ_EMPTY(&del_free) && add_delete_chunk() != 0) {
+        pthread_mutex_unlock(&del_pool_mutex);
+        return NULL;
     }
-
-    if (del_pool_count >= del_pool_size) {
-        unsigned new_size = (del_pool_size == 0) ? POOL_INITIAL_SIZE : (del_pool_size * 2);
-        struct delete_entry *tmp = realloc(del_pool, new_size * sizeof(struct delete_entry));
-        if (!tmp) {
-            pthread_mutex_unlock(&del_pool_mutex);
-            return NULL;
-        }
-        memset(tmp + del_pool_size, 0, (new_size - del_pool_size) * sizeof(struct delete_entry));
-        del_pool = tmp;
-        del_pool_size = new_size;
-    }
-
-    struct delete_entry *ret = del_pool + del_pool_count++;
+    ret = TAILQ_FIRST(&del_free);
+    TAILQ_REMOVE(&del_free, ret, entries);
     ret->in_use = 1;
     pthread_mutex_unlock(&del_pool_mutex);
     return ret;
@@ -189,70 +175,64 @@ void release_delete_entry(struct delete_entry *p) {
     if (p) {
         pthread_mutex_lock(&del_pool_mutex);
         memset(p, 0, sizeof(*p));
+        TAILQ_INSERT_TAIL(&del_free, p, entries);
         pthread_mutex_unlock(&del_pool_mutex);
     }
 }
 
-/* ============================================================
- * Inicialização e finalização
- * ============================================================ */
+static void free_payload_chunks(void) {
+    while (payload_chunks != NULL) {
+        struct payload_chunk *chunk = payload_chunks;
+        payload_chunks = chunk->next;
+        free(chunk);
+    }
+}
+
+static void free_job_chunks(void) {
+    while (job_chunks != NULL) {
+        struct job_chunk *chunk = job_chunks;
+        job_chunks = chunk->next;
+        free(chunk);
+    }
+}
+
+static void free_cmd_chunks(void) {
+    while (cmd_chunks != NULL) {
+        struct cmd_chunk *chunk = cmd_chunks;
+        cmd_chunks = chunk->next;
+        free(chunk);
+    }
+}
+
+static void free_delete_chunks(void) {
+    while (del_chunks != NULL) {
+        struct delete_chunk *chunk = del_chunks;
+        del_chunks = chunk->next;
+        free(chunk);
+    }
+}
+
 int init_pools(void) {
-    payload_pool = calloc(POOL_INITIAL_SIZE, sizeof(struct payload_buf));
-    if (!payload_pool) return -1;
-    payload_pool_size = POOL_INITIAL_SIZE;
-    payload_pool_count = 0;
-
-    job_pool = calloc(POOL_INITIAL_SIZE, sizeof(struct job_pool_entry));
-    if (!job_pool) {
-        free(payload_pool);
-        return -1;
-    }
-    job_pool_size = POOL_INITIAL_SIZE;
-    job_pool_count = 0;
-
-    cmd_pool = calloc(POOL_INITIAL_SIZE, sizeof(struct control_cmd_pooled));
-    if (!cmd_pool) {
-        free(payload_pool);
-        free(job_pool);
-        return -1;
-    }
-    cmd_pool_size = POOL_INITIAL_SIZE;
-    cmd_pool_count = 0;
-
-    del_pool = calloc(POOL_INITIAL_SIZE, sizeof(struct delete_entry));
-    if (!del_pool) {
-        free(payload_pool);
-        free(job_pool);
-        free(cmd_pool);
-        return -1;
-    }
-    del_pool_size = POOL_INITIAL_SIZE;
-    del_pool_count = 0;
-
+    if (add_payload_chunk() != 0) return -1;
+    if (add_job_chunk() != 0) goto fail_payload;
+    if (add_cmd_chunk() != 0) goto fail_job;
+    if (add_delete_chunk() != 0) goto fail_cmd;
     return 0;
+
+fail_cmd:
+    free_cmd_chunks();
+fail_job:
+    free_job_chunks();
+fail_payload:
+    free_payload_chunks();
+    return -1;
 }
 
 void destroy_pools(void) {
-    free(payload_pool);
-    payload_pool = NULL;
-    payload_pool_size = 0;
-    payload_pool_count = 0;
-
-    free(job_pool);
-    job_pool = NULL;
-    job_pool_size = 0;
-    job_pool_count = 0;
-
-    free(cmd_pool);
-    cmd_pool = NULL;
-    cmd_pool_size = 0;
-    cmd_pool_count = 0;
-
-    free(del_pool);
-    del_pool = NULL;
-    del_pool_size = 0;
-    del_pool_count = 0;
-
+    free_payload_chunks();
+    free_job_chunks();
+    free_cmd_chunks();
+    free_delete_chunks();
     pthread_mutex_destroy(&payload_mutex);
     pthread_mutex_destroy(&job_mutex);
     pthread_mutex_destroy(&cmd_pool_mutex);

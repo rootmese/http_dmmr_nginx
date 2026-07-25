@@ -3,6 +3,7 @@
 #include "dmmr_protocol.h"
 #include "dmmr_net.h"
 #include "dmmr_pool.h"
+#include "dmmr_string.h"
 #include <sys/socket.h>
 #include <netinet/in.h>
 #include <arpa/inet.h>
@@ -45,8 +46,7 @@ void init_peers(void) {
 void add_peer(const char *addr, int port) {
     struct peer *p = malloc(sizeof(*p));
     if (!p) return;
-    strncpy(p->addr, addr, sizeof(p->addr)-1);
-    p->addr[sizeof(p->addr)-1] = '\0';
+    (void)strlcpy(p->addr, addr, sizeof(p->addr));
     p->port = port;
     p->sock = -1;  /* será conectado no primeiro uso */
     pthread_mutex_lock(&peers_mutex);

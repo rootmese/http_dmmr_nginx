@@ -5,6 +5,7 @@
 #include "dmmr_db.h"
 #include "dmmr_cluster.h"
 #include "dmmr_pool.h"
+#include "dmmr_string.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <stddef.h>
@@ -915,7 +916,7 @@ int main(int argc, char *argv[]) {
             struct sockaddr_un addr;
             memset(&addr, 0, sizeof(addr));
             addr.sun_family = AF_UNIX;
-            strncpy(addr.sun_path, socket_path, sizeof(addr.sun_path) - 1);
+            (void)strlcpy(addr.sun_path, socket_path, sizeof(addr.sun_path));
             unlink(socket_path);
             if (bind(unix_fd, (struct sockaddr *)&addr, sizeof(addr)) == 0 &&
                 listen(unix_fd, SOMAXCONN) == 0) {

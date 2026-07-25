@@ -4,6 +4,7 @@
 #include <stddef.h>
 #include <stdint.h>
 #include <pthread.h>
+#include <sys/queue.h>
 #include "dmmr_config.h"
 
 /* ============================================================
@@ -13,6 +14,7 @@ struct payload_buf {
     int in_use;                              /* flag de uso (0 = livre) */
     uint8_t data[MAX_KEY_LEN + MAX_VALUE_LEN]; /* buffer de dados */
     size_t len;                              /* tamanho efetivo dos dados */
+    TAILQ_ENTRY(payload_buf) free_entries;
 };
 
 struct payload_buf *get_payload_buf(void);
@@ -24,6 +26,7 @@ void release_payload_buf(struct payload_buf *p);
 struct job_pool_entry {
     int in_use;    /* flag de uso (0 = livre) */
     int fd;        /* descritor do cliente */
+    TAILQ_ENTRY(job_pool_entry) free_entries;
 };
 
 struct job_pool_entry *get_job_entry(void);
@@ -32,8 +35,6 @@ void release_job_entry(struct job_pool_entry *p);
 /* ============================================================
  * Pool de control_cmd (substituir malloc em enqueue_broadcast)
  * ============================================================ */
-#include <sys/queue.h>
-
 struct control_cmd_pooled {
     int in_use;                            /* flag de uso (0 = livre) */
     int type;

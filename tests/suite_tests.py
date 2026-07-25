@@ -1139,7 +1139,7 @@ class DMMRTestSuite(BaseIntegrationTest):
     # ==================================================================
 
     def test_14_stability_short(self):
-        """Verifica que o consumo de memória não cresce >20% em 60s sob carga."""
+        """Verifica que o RSS não cresce >20% após o warm-up, em 60s sob carga."""
         if not psutil:
             LOG.skip('psutil not installed — skipping stability test.')
             self.skipTest('psutil não instalado')
@@ -1147,7 +1147,10 @@ class DMMRTestSuite(BaseIntegrationTest):
         LOG.section('14 — Stability — Memory Leak Check')
 
         def _test(port):
-            LOG.info(f'[:{port}] Generating load for 60s...')
+            warmup_seconds = 20
+            sample_interval = 10
+            sample_count = 4
+            LOG.info(f'[:{port}] Generating load for 60s ({warmup_seconds}s warm-up)...')
             url = f'http://127.0.0.1:{port}/api/v1'
             stop_event = threading.Event()
 
@@ -1163,22 +1166,28 @@ class DMMRTestSuite(BaseIntegrationTest):
             t.start()
 
             cache_proc = psutil.Process(self.cache_mgr.pid)
+            # Pools por chunks fazem o RSS crescer até a capacidade de trabalho.
+            # Esse crescimento inicial não é leak; a medição começa após o warm-up.
+            time.sleep(warmup_seconds)
+            baseline_mem = cache_proc.memory_info().rss
+            LOG.info(f'[:{port}] RSS after warm-up: {baseline_mem / 1024:.0f} KB')
+
             mem_samples = []
-            for i in range(6):
-                time.sleep(10)
+            for i in range(sample_count):
+                time.sleep(sample_interval)
                 rss = cache_proc.memory_info().rss
                 mem_samples.append(rss)
-                LOG.info(f'[:{port}] Sample {i + 1}/6: RSS = {rss / 1024:.0f} KB')
+                LOG.info(f'[:{port}] Sample {i + 1}/{sample_count}: RSS = {rss / 1024:.0f} KB')
 
             stop_event.set()
             t.join(timeout=3)
 
-            if len(mem_samples) > 1:
-                start_mem, end_mem = mem_samples[0], mem_samples[-1]
-                growth = (end_mem - start_mem) / start_mem if start_mem else 0
+            if mem_samples:
+                peak_mem = max(mem_samples)
+                growth = (peak_mem - baseline_mem) / baseline_mem if baseline_mem else 0
                 LOG.info(f'[:{port}] Memory growth: {growth:.1%}')
                 self.assertLess(growth, 0.20,
-                                f'Memory grew {growth:.1%} (max 20%)')
+                                f'Memory grew {growth:.1%} after warm-up (max 20%)')
                 LOG.ok(f'[:{port}] Memory stable ({growth:.1%} growth).')
 
         for port in (CFG.NGINX_TCP_PORT, CFG.NGINX_UNIX_PORT):

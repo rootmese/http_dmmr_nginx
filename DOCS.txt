@@ -72,3 +72,14 @@ Implementation notes:
 - The module keeps a reusable connection to the cache daemon when possible;
 - Socket failures are handled by closing the broken connection and reconnecting;
 - The rate limiting logic uses an in-memory tree and should be evolved to shared memory for multi-worker environments.
+
+Memory pools (http_dmmr_cache/dmmr_pool.c):
+- payload_buf, job_pool_entry, control_cmd_pooled and delete_entry use fixed-size chunks.
+- Each chunk contains POOL_INITIAL_SIZE entries (configured in dmmr_config.h). A new chunk is allocated only when its pool's free list is empty; existing entries are never moved.
+- Each pool has a TAILQ free list protected by its own mutex. get_* removes the first free entry and release_* clears and reinserts it, both in O(1).
+- Pointers returned by get_* remain valid while the caller owns the entry. control_cmd_pooled and delete_entry must be removed from their processing queue before release_*, because their TAILQ link is then reused by the pool free list.
+- The pools do not use realloc. destroy_pools releases every chunk when the daemon stops.
+
+Stability test:
+- Test 14 in tests/suite_tests.py runs 20 seconds of load warm-up before taking the RSS baseline, then monitors the peak RSS for 40 seconds.
+- Warm-up excludes normal page commitment while chunks are first used; the test still fails if RSS grows more than 20% after the baseline.

@@ -56,12 +56,14 @@ typedef struct {
     ngx_str_t            cache_addr;     /* endereço do cache (ex: unix:/tmp/dmmr_cache.sock ou 127.0.0.1:9080) */
     ngx_uint_t           rate_limit;     /* limite de requisições por janela */
     ngx_msec_t           rate_window;    /* janela de rate limit em ms */
+    ngx_shm_zone_t      *rate_zone;      /* zona compartilhada entre workers */
 } ngx_http_dmmr_conf_t;
 
 /* Funções públicas */
 ngx_int_t ngx_http_dmmr_router(ngx_http_request_t *r, ngx_http_dmmr_ctx_t *ctx);
 ngx_int_t ngx_http_dmmr_auth(ngx_http_request_t *r, ngx_http_dmmr_ctx_t *ctx);
-ngx_int_t ngx_http_dmmr_rate_init(ngx_cycle_t *cycle);
+ngx_int_t ngx_http_dmmr_rate_init(ngx_conf_t *cf, ngx_http_dmmr_conf_t *main_conf);
+char *ngx_http_dmmr_rate_zone(ngx_conf_t *cf, ngx_command_t *cmd, void *conf);
 ngx_int_t ngx_http_dmmr_rate_limit(ngx_http_request_t *r, ngx_http_dmmr_ctx_t *ctx);
 ngx_int_t ngx_http_dmmr_plugins(ngx_http_request_t *r, ngx_http_dmmr_ctx_t *ctx);
 ngx_int_t ngx_http_dmmr_upstream(ngx_http_request_t *r, ngx_http_dmmr_ctx_t *ctx);

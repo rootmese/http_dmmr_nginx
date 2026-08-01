@@ -1155,11 +1155,11 @@ while (running) {
     }
     free(worker_threads);
 
+    /* O listener de cluster pode estar bloqueado em accept().  Feche-o
+     * antes do join para acordar a thread e permitir o shutdown gracioso. */
+    cluster_stop_discovery();
+    cluster_close_listener();
     pthread_join(cluster_thread, NULL);
-    if (cluster_listen_fd >= 0) {
-        close(cluster_listen_fd);
-        cluster_listen_fd = -1;
-    }
 
     pthread_join(reaper_thread, NULL);
 

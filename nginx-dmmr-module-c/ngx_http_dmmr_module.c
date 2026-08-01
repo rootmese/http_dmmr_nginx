@@ -265,6 +265,13 @@ static ngx_command_t ngx_http_dmmr_commands[] = {
       0,
       NULL },
 
+    { ngx_string("dmmr_rate_zone"),
+      NGX_HTTP_MAIN_CONF|NGX_CONF_TAKE1,
+      ngx_http_dmmr_rate_zone,
+      NGX_HTTP_MAIN_CONF_OFFSET,
+      0,
+      NULL },
+
     ngx_null_command
 };
 
@@ -408,7 +415,10 @@ ngx_http_dmmr_postconfiguration(ngx_conf_t *cf)
     ngx_http_handler_pt *h;
     ngx_http_core_main_conf_t *cmcf;
 
-    if (ngx_http_dmmr_rate_init(cf->cycle) != NGX_OK) {
+    ngx_http_dmmr_conf_t *main_conf;
+
+    main_conf = ngx_http_conf_get_module_main_conf(cf, ngx_http_dmmr_module);
+    if (main_conf == NULL || ngx_http_dmmr_rate_init(cf, main_conf) != NGX_OK) {
         return NGX_ERROR;
     }
 

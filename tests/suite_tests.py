@@ -647,12 +647,7 @@ class DMMRTestSuite(BaseIntegrationTest):
         cls.backend_mgr.start_all()
         cls.cache_mgr.start(['--unix', '--tcp'])
 
-        client = CacheClient(use_unix=True)
-        for key, value in ((b'123456', b'user1'), (b'abcdef', b'user2'), (b'987654', b'admin')):
-            status, _ = client.send_frame(OP_SET, key, value)
-            if status != 0:
-                raise RuntimeError(f'Failed to seed auth key {key.decode("utf-8", "ignore")}, status={status}')
-        LOG.ok('Seeded authentication keys into cache.')
+        cls._seed_auth_keys()
 
         LOG.info('Checking Nginx availability...')
         for port in (CFG.NGINX_TCP_PORT, CFG.NGINX_UNIX_PORT):
@@ -664,6 +659,16 @@ class DMMRTestSuite(BaseIntegrationTest):
             LOG.ok(f'Nginx responding on port {port}.')
 
         LOG.section('Running Tests')
+
+    @classmethod
+    def _seed_auth_keys(cls):
+        """Restaura as credenciais de teste depois de reiniciar o cache em memÃ³ria."""
+        client = CacheClient(use_unix=True)
+        for key, value in ((b'123456', b'user1'), (b'abcdef', b'user2'), (b'987654', b'admin')):
+            status, _ = client.send_frame(OP_SET, key, value)
+            if status != 0:
+                raise RuntimeError(f'Failed to seed auth key {key.decode("utf-8", "ignore")}, status={status}')
+        LOG.ok('Seeded authentication keys into cache.')
 
     @classmethod
     def tearDownClass(cls):
@@ -698,6 +703,7 @@ class DMMRTestSuite(BaseIntegrationTest):
         LOG.ok('Socket cleaned up after stop.')
 
         self.cache_mgr.start(['--unix', '--tcp'])
+        self._seed_auth_keys()
         LOG.ok('Cache restarted for subsequent tests.')
 
     # ==================================================================
@@ -739,6 +745,7 @@ class DMMRTestSuite(BaseIntegrationTest):
                 self.cache_mgr.stop()
 
         self.cache_mgr.start(['--unix', '--tcp'])
+        self._seed_auth_keys()
         LOG.ok('Cache restored to default mode.')
 
     # ==================================================================
@@ -1064,6 +1071,7 @@ class DMMRTestSuite(BaseIntegrationTest):
         self._test_on_both_ports(_test)
 
         self.cache_mgr.start(['--unix', '--tcp'])
+        self._seed_auth_keys()
         LOG.ok('Cache restored.')
 
     # ==================================================================
@@ -1098,6 +1106,7 @@ class DMMRTestSuite(BaseIntegrationTest):
             self.cache_mgr.stop()
             time.sleep(1)
             self.cache_mgr.start(['--unix', '--tcp'])
+            self._seed_auth_keys()
             time.sleep(2)
 
             stop_event.set()
@@ -1132,6 +1141,7 @@ class DMMRTestSuite(BaseIntegrationTest):
             LOG.info(f'[:{port}] Restarting cache...')
             self.cache_mgr.stop()
             self.cache_mgr.start(['--unix', '--tcp'])
+            self._seed_auth_keys()
             time.sleep(2)
 
             resp = self.http.get(port)
@@ -1216,18 +1226,24 @@ class DMMRTestSuite(BaseIntegrationTest):
             LOG.info(f'[:{port}] Sending up to 130 requests...')
             url = f'http://127.0.0.1:{port}/api/v1'
             success_count = 0
+            rate_limited = False
             for i in range(130):
                 resp = requests.get(url, headers=self.http.auth_headers)
-                if resp.status_code != 429:
+                self.assertIn(resp.status_code, (200, 429),
+                              f'Expected 200 or 429, got {resp.status_code}')
+                if resp.status_code == 200:
                     success_count += 1
                 else:
                     LOG.info(f'[:{port}] Rate limited at request #{i + 1}')
+                    rate_limited = True
                     break
 
             self.assertGreaterEqual(success_count, 1,
                                     f'Expected at least 1 success before rate limit, got 0')
-            self.assertLessEqual(success_count, 130,
-                                 f'Rate limit never triggered in 130 requests')
+            self.assertLessEqual(success_count, CFG.RATE_LIMIT,
+                                 f'Too many requests passed before rate limiting: {success_count}')
+            self.assertTrue(rate_limited,
+                            f'Rate limit did not trigger after {success_count} successful requests')
             LOG.ok(f'[:{port}] {success_count} requests before rate limit.')
 
             LOG.info(f'[:{port}] Waiting 62s for rate window reset...')

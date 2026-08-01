@@ -5,7 +5,9 @@
 
 A native C, high-performance API gateway module for Nginx, coupled with a distributed persistence cache layer powered by Berkeley DB. The gateway performs routing, authentication, and rate limiting directly in Nginx worker processes; the cache uses stable pool metadata and demand-sized buffers to keep memory use bounded under normal traffic.
 
-> **0.2.0-beta:** the complete integration suite passes (16 tests / 113 checks).
+> **0.2.0-beta:** the integration suite contains 16 test groups covering the
+> cache, gateway and recovery paths. Run it on the current build before a
+> release, because it starts and stops real local processes.
 > Cache authentication currently uses synchronous socket I/O with one-second
 > timeouts and one retry. Non-blocking, event-driven cache I/O is the highest
 > priority for the next release; it is not part of this beta.
@@ -23,13 +25,13 @@ graph TD
     subgraph nginx_module ["nginx-dmmr-module-c"]
         Nginx --> Router["🧭 Router Module"]
         Router --> Auth["🔒 Auth Module"]
-        Auth --> RateLimit["⏳ Patricia Trie Rate Limiter"]
+        Auth --> RateLimit["⏳ Shared-Memory Rate Limiter"]
     end
     
     Auth -->|Queries via Binary Protocol| CacheDaemon["⚡ DMMR Cache Daemon (http_dmmr_cache)"]
     
     subgraph cache_service ["DMMR Cache Service"]
-        CacheDaemon --> MemoryPools["📦 Static Memory Pools"]
+        CacheDaemon --> MemoryPools["📦 Pooled Metadata + Demand-Sized Buffers"]
         CacheDaemon --> BDB["🗄️ Berkeley DB (apikeys.db)"]
         CacheDaemon --> GC["🧹 Async Garbage Collector (TTL)"]
         CacheDaemon --> Broadcast["📢 Broadcast Sync Subsystem"]
@@ -44,7 +46,7 @@ graph TD
 ## ⚡ Key Architectural Principles
 
 - **Bounded Pool Metadata, Demand-Sized Buffers**: queue metadata is pooled in stable chunks. Payload and replication-value buffers are allocated only for the received value; buffers larger than 64 KiB are released when returned to the payload pool.
-- **Patricia Trie Rate Limiter**: Implemented in-memory locally within the Nginx worker processes, eliminating external dependencies like Redis.
+- **Shared-Memory Rate Limiter**: A slab-backed rbtree and LRU/expiry queue are shared by all Nginx workers, so a client IP has one counter per zone without requiring Redis.
 - **Eventual Consistency**: Peer-to-peer sync via background replication commands (`OP_SYNC`).
 - **Deterministic Routing**: Priority-based path, method, and host matching.
 
@@ -93,6 +95,9 @@ The cache daemon now covers a broader set of correctness and operational concern
 - GET requests map Berkeley DB not-found results to the protocol not-found status instead of falling back to a generic error.
 - Cluster peers are reaped when they become stale or unreachable, preventing leaked connections and stale state.
 - Cluster frames are validated with cluster identity checks, and discovery can recover from known peers as well as seed nodes.
+- Graceful shutdown stops discovery and closes the cluster listener before
+  joining its thread, so a listener blocked in `accept()` is released without
+  requiring `SIGKILL`.
 
 ### Run Options
 
@@ -288,6 +293,10 @@ Add the following configuration blocks to manage routing, backends, and cache co
 
 ```nginx
 http {
+    # One shared counter store for every Nginx worker. Optional: if omitted,
+    # the module creates dmmr_rate_limit with 10 MiB by default.
+    dmmr_rate_zone dmmr_limit:10m;
+
     dmmr_enable on;
 
     # Backend Services
@@ -309,7 +318,7 @@ http {
             dmmr_cache_addr unix:/run/dmmr/dmmr_cache.sock;
             # Or use TCP: dmmr_cache_addr tcp:127.0.0.1:9080;
             
-            # Local Rate Limiting Configuration
+            # Global-per-IP Rate Limiting Configuration
             dmmr_rate_limit 120;
             dmmr_rate_window 60000; # 1 minute in ms
 
@@ -339,15 +348,21 @@ cd tests
 python3 suite_tests.py
 ```
 
+The fixture restores its test credentials after every normal cache restart.
+The rate-limit check accepts only `200` or `429` and requires the limit to be
+reached, so an authentication failure cannot be counted as a successful request.
+
 The suite covers listener modes, modern and legacy protocols, malformed input,
 authentication, routing, upstream/cache failures, recovery, 60-second RSS
 stability, rate limiting, and a 20×50-request load simulation.
 
-### Beta operating note
+### Graceful shutdown
 
-The current daemon has a known graceful-shutdown limitation: its cluster
-listener can remain blocked in `accept()` until forcibly terminated. Do not
-claim zero-downtime restarts until that shutdown path is corrected and tested.
+On `SIGTERM` or `SIGINT`, the daemon stops discovery, closes its cluster
+listener and then joins the listener thread. This ordering releases a blocking
+`accept()` call and allows normal process termination. Validate this path in
+the deployment environment with a real `SIGTERM` before relying on automated
+restarts.
 
 ---
 
@@ -358,4 +373,4 @@ The codebase has undergone refactoring to resolve common execution failures unde
 1. **TCP Streaming Header Fix**: Resolved a logic flaw in `ngx_http_dmmr_auth.c` where the socket header loop broke out early at 4 bytes even when receiving a modern 8-byte response header. This ensures compatibility with TCP streaming segment boundaries.
 2. **Buffer Overflow Guards**: Replaced weak key length checks in `ngx_http_dmmr_auth.c` to prevent heap/stack overflow. API keys larger than the static request buffer boundary (`sizeof(req_buf) - sizeof(frame)`) are now rejected immediately at gateway level.
 3. **Byte Order De-duplication**: Fixed a bug in `dmmr_server.c` where host byte-order conversions (`ntohl` / `ntohs`) were applied twice, causing key lengths to scale into invalid values and drop connections.
-4. **Compile-time Rate Limit fix**: Fixed scoping issue in `ngx_http_dmmr_rate_limit.c` by passing the `rate_window` context to the node pruning routines, eliminating compile errors.
+4. **Shared rate limiting**: rate counters now live in an Nginx shared-memory zone, making the configured limit apply across worker processes.

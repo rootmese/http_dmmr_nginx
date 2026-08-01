@@ -42,9 +42,14 @@ Example curl commands:
   than curl.
 
 Configuration example:
+http {
+    # Shared by all Nginx workers; defaults to dmmr_rate_limit:10m if omitted.
+    dmmr_rate_zone dmmr_limit:10m;
+
 location / {
     dmmr_enable on;
     dmmr_cache_addr unix:/run/dmmr/dmmr_cache.sock;
+}
 }
 
 WSL/Linux with systemd Nginx:
@@ -84,7 +89,8 @@ Implementation notes:
 - Cluster frames validate cluster identity and discovery can recover from seeds and known peers;
 - The module opens a cache connection for each authentication lookup and closes it after the response;
 - Socket failures are retried and then reported as 503;
-- The rate limiting logic uses an in-memory tree and should be evolved to shared memory for multi-worker environments.
+- Rate counters use an Nginx shared-memory slab zone, rbtree and LRU/expiry queue, so the configured limit is global across workers for each client IP.
+- dmmr_rate_zone accepts name:size in the http context (for example dmmr_rate_zone dmmr_limit:10m); omitting it creates dmmr_rate_limit:10m.
 
 Memory pools (http_dmmr_cache/dmmr_pool.c):
 - payload_buf, job_pool_entry, control_cmd_pooled and delete_entry use fixed-size chunks for stable metadata.

@@ -65,6 +65,16 @@ location / {
 }
 ```
 
+For a global rate limit across Nginx workers, define a shared zone in `http`:
+
+```nginx
+dmmr_rate_zone dmmr_limit:10m;
+```
+
+If omitted, the module creates a default 10 MiB zone named
+`dmmr_rate_limit`. The zone uses a shared rbtree keyed by client IP and a
+bounded LRU/expiry queue; all workers therefore apply the same counter.
+
 ## Persistence
 
 API keys are stored in Berkeley DB, which provides local persistence without requiring Redis.
@@ -100,4 +110,4 @@ backend failures, recovery, rate limiting, load, and RSS stability.
 The project already supports the basic cache integration, but it can still evolve in performance and robustness with:
 - non-blocking cache I/O in the Nginx module;
 - graceful shutdown of the cluster listener and active client workers;
-- shared-memory integration for rate limiting across Nginx workers.
+- optional rate-limit keys based on authenticated user or API key, in addition to client IP.

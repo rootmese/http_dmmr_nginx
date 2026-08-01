@@ -1191,9 +1191,9 @@ void *cluster_listener(void *arg)
         handle_cluster_connection(peer_fd);
     }
 
-    close(listen_fd);
     if (cluster_listen_fd == listen_fd) {
         cluster_listen_fd = -1;
+        close(listen_fd);
     }
     return NULL;
 }

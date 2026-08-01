@@ -46,10 +46,16 @@ int broadcast_workers_running = 0;
 DB *dbp = NULL;
 volatile sig_atomic_t running = 1;
 uint64_t my_node_id = 0;
+static uint64_t cache_request_count = 0;
+static uint64_t cache_hit_count = 0;
+static uint64_t cache_miss_count = 0;
+static uint64_t cache_set_count = 0;
+static uint64_t cache_del_count = 0;
 
 void enqueue_broadcast(const char *key, size_t key_len,
                        const void *value, size_t value_len,
-                       uint64_t ts, uint64_t node_id);
+                       uint64_t ts, uint64_t node_id,
+                       uint64_t expire_at, uint16_t flags);
 
 /* ============================================================
  * Fila de jobs  –  usa job_pool_entry do pool
@@ -128,16 +134,9 @@ static void *worker_routine(void *arg);
 static void handle_client(int fd);
 static void send_legacy_response(int fd, uint16_t status, uint16_t payload_len, const void *payload);
 static int process_legacy_request(int fd, uint16_t opcode, uint16_t key_len, const uint8_t *payload);
-static uint64_t now_micros(void);
 static void *gc_worker_routine(void *arg);
 
 /* ---------- Implementação das funções ---------- */
-
-uint64_t now_micros(void) {
-    struct timespec ts;
-    clock_gettime(CLOCK_REALTIME, &ts);
-    return ((uint64_t) ts.tv_sec * 1000000ULL) + (uint64_t) (ts.tv_nsec / 1000);
-}
 
 void send_legacy_response(int fd, uint16_t status, uint16_t payload_len, const void *payload) {
     uint8_t resp[4 + 4096];
@@ -156,7 +155,7 @@ static void process_control_cmd(struct control_cmd_pooled *cmd) {
         case CMD_BROADCAST:
             broadcast_sync(cmd->key, cmd->key_len,
                            cmd->value, cmd->value_len,
-                           cmd->ts, cmd->node_id);
+                           cmd->ts, cmd->node_id, cmd->expire_at, cmd->flags);
             break;
         case CMD_SHUTDOWN:
             // já tratado pelo running
@@ -279,10 +278,10 @@ static void *gc_worker_routine(void *arg) {
             /* Exclusão física do banco */
             db_del_key(de->key, de->key_len);
 
-            /* Enfileirar broadcast de DEL */
+            /* Enfileirar broadcast de DEL com tombstone */
             uint64_t ts_now = now_micros();
             enqueue_broadcast((const char *)de->key, de->key_len,
-                              NULL, 0, ts_now, my_node_id);
+                              NULL, 0, ts_now, my_node_id, 0, FLAG_TOMBSTONE);
 
             release_delete_entry(de);
 
@@ -406,13 +405,16 @@ static void *control_thread_routine(void *arg) {
  * ============================================================ */
 void enqueue_broadcast(const char *key, size_t key_len,
                        const void *value, size_t value_len,
-                       uint64_t ts, uint64_t node_id) {
+                       uint64_t ts, uint64_t node_id,
+                       uint64_t expire_at, uint16_t flags) {
     struct control_cmd_pooled *cmd = get_control_cmd();
     if (!cmd) return;
 
     cmd->type = CMD_BROADCAST;
     cmd->ts = ts;
     cmd->node_id = node_id;
+    cmd->expire_at = expire_at;
+    cmd->flags = flags;
 
     /* Copiar chave inline */
     size_t klen = key_len;
@@ -420,12 +422,16 @@ void enqueue_broadcast(const char *key, size_t key_len,
     memcpy(cmd->key, key, klen);
     cmd->key_len = klen;
 
-    /* Copiar valor inline */
+    /* Copiar somente o valor efetivamente recebido. */
     if (value && value_len > 0) {
         size_t vlen = value_len;
         if (vlen > MAX_VALUE_LEN) vlen = MAX_VALUE_LEN;
-        memcpy(cmd->value_data, value, vlen);
-        cmd->value = cmd->value_data;
+        cmd->value = malloc(vlen);
+        if (cmd->value == NULL) {
+            release_control_cmd(cmd);
+            return;
+        }
+        memcpy(cmd->value, value, vlen);
         cmd->value_len = vlen;
     } else {
         cmd->value = NULL;
@@ -466,17 +472,62 @@ int process_frame(int fd, struct dmmr_frame *frame, const uint8_t *payload,
     switch (opcode) {
         case OP_GET: {
             DMMR_LOG_DEBUG("process_frame: OP_GET key='%.*s'", (int)key_len, key);
+            cache_request_count++;
             uint64_t ts_found = 0, node_found = 0, expire_at = 0;
             void *memory = NULL;
             size_t value_len_out = 0;
             int rc = db_get_with_meta(key, key_len, &ts_found, &node_found, &memory, &value_len_out, &expire_at);
-            if (rc == 0) {
+            if (rc == DMMR_DB_APPLIED) {
+                cache_hit_count++;
                 status = DMMR_PROTO_STATUS_OK;
                 response_payload = (uint8_t *) memory;
                 response_len = (uint32_t) value_len_out;
-            } else if (rc == -1) {
+            } else if (rc == DMMR_DB_NOT_FOUND) {
+                cache_miss_count++;
                 status = DMMR_PROTO_STATUS_NOT_FOUND;
+            } else {
+                cache_miss_count++;
+                status = DMMR_PROTO_STATUS_ERROR;
             }
+            break;
+        }
+        case OP_PING: {
+            const char *pong = "pong";
+            response_payload = malloc(strlen(pong) + 1);
+            if (response_payload != NULL) {
+                memcpy(response_payload, pong, strlen(pong) + 1);
+                response_len = (uint32_t) strlen(pong);
+            }
+            status = DMMR_PROTO_STATUS_OK;
+            break;
+        }
+        case OP_STATUS: {
+            const char *status_payload = "ok";
+            response_payload = malloc(strlen(status_payload) + 1);
+            if (response_payload != NULL) {
+                memcpy(response_payload, status_payload, strlen(status_payload) + 1);
+                response_len = (uint32_t) strlen(status_payload);
+            }
+            status = DMMR_PROTO_STATUS_OK;
+            break;
+        }
+        case OP_STATS: {
+            char stats_payload[256];
+            int written = snprintf(stats_payload, sizeof(stats_payload),
+                                   "requests=%llu hits=%llu misses=%llu sets=%llu deletes=%llu",
+                                   (unsigned long long) cache_request_count,
+                                   (unsigned long long) cache_hit_count,
+                                   (unsigned long long) cache_miss_count,
+                                   (unsigned long long) cache_set_count,
+                                   (unsigned long long) cache_del_count);
+            if (written > 0) {
+                response_payload = malloc((size_t) written + 1);
+                if (response_payload != NULL) {
+                    memcpy(response_payload, stats_payload, (size_t) written + 1);
+                    response_len = (uint32_t) written;
+                }
+            }
+            status = DMMR_PROTO_STATUS_OK;
             break;
         }
         case OP_SET:
@@ -494,24 +545,30 @@ int process_frame(int fd, struct dmmr_frame *frame, const uint8_t *payload,
                 ts_use = now_micros();
                 node_use = my_node_id;
             }
+            cache_request_count++;
+            cache_set_count++;
             uint64_t expire_at = now_micros() + TTL_DEFAULT;
             int rc = db_set_with_meta(key, key_len, ts_use, node_use, value, value_len, expire_at);
             if (rc == 0) {
                 status = DMMR_PROTO_STATUS_OK;
                 if(!from_peer)
-                    enqueue_broadcast(key, key_len, value, value_len, ts_use, node_use);
+                    enqueue_broadcast(key, key_len, value, value_len,
+                                      ts_use, node_use, expire_at, FLAG_NONE);
             }
             break;
         }
         case OP_DEL: {
             DMMR_LOG_DEBUG("process_frame: OP_DEL key='%.*s'", (int)key_len, key);
+            cache_request_count++;
+            cache_del_count++;
             int rc = db_del_key(key, key_len);
             if (rc == 0) {
                 status = DMMR_PROTO_STATUS_OK;
             }
             if (!from_peer) {
                 uint64_t ts_del = now_micros();
-                enqueue_broadcast(key, key_len, NULL, 0, ts_del, my_node_id);
+                enqueue_broadcast(key, key_len, NULL, 0, ts_del, my_node_id,
+                                  0, FLAG_TOMBSTONE);
             }
             break;
         }
@@ -545,8 +602,11 @@ int process_frame(int fd, struct dmmr_frame *frame, const uint8_t *payload,
  * read_frame – usa pool de payload_buf em vez de malloc
  * ============================================================ */
 int read_frame(int fd, struct dmmr_frame *frame, uint8_t **payload,
+               struct payload_buf **payload_buf,
                bool *is_legacy, uint16_t *legacy_opcode, uint16_t *legacy_key_len) {
     uint8_t prefix[4];
+    *payload = NULL;
+    *payload_buf = NULL;
     if (recv_full(fd, prefix, sizeof(prefix), 0) != (ssize_t) sizeof(prefix)) {
         return -1;
     }
@@ -582,16 +642,17 @@ int read_frame(int fd, struct dmmr_frame *frame, uint8_t **payload,
         }
 
         /* Usa pool de payload_buf em vez de malloc */
-        struct payload_buf *pbuf = get_payload_buf();
+        struct payload_buf *pbuf = get_payload_buf(total_payload);
         if (pbuf == NULL) {
             return -4;
         }
         *payload = pbuf->data;
-        pbuf->len = total_payload;
+        *payload_buf = pbuf;
 
         if (recv_full(fd, *payload, total_payload, 0) != (ssize_t) total_payload) {
             release_payload_buf(pbuf);
             *payload = NULL;
+            *payload_buf = NULL;
             return -5;
         }
         return 0;
@@ -607,32 +668,20 @@ int read_frame(int fd, struct dmmr_frame *frame, uint8_t **payload,
     }
 
     /* Usa pool de payload_buf em vez de malloc */
-    struct payload_buf *pbuf = get_payload_buf();
+    struct payload_buf *pbuf = get_payload_buf(*legacy_key_len);
     if (pbuf == NULL) {
         return -4;
     }
     *payload = pbuf->data;
-    pbuf->len = *legacy_key_len;
+    *payload_buf = pbuf;
 
     if (recv_full(fd, *payload, *legacy_key_len, 0) != (ssize_t) *legacy_key_len) {
         release_payload_buf(pbuf);
         *payload = NULL;
+        *payload_buf = NULL;
         return -5;
     }
     return 0;
-}
-
-/* ============================================================
- * Função auxiliar para liberar payload do pool
- * ============================================================
- * Como o payload é um ponteiro para dentro de um payload_buf,
- * precisamos recuperar o payload_buf a partir do ponteiro.
- */
-static void release_payload_from_ptr(uint8_t *payload_ptr) {
-    if (!payload_ptr) return;
-    struct payload_buf *pbuf = (struct payload_buf *)
-        ((uint8_t *)payload_ptr - offsetof(struct payload_buf, data));
-    release_payload_buf(pbuf);
 }
 
 int process_legacy_request(int fd, uint16_t opcode, uint16_t key_len, const uint8_t *payload) {
@@ -664,10 +713,12 @@ void handle_client(int fd) {
     while (1) {
         struct dmmr_frame frame;
         uint8_t *payload = NULL;
+        struct payload_buf *payload_buf = NULL;
         bool is_legacy = false;
         uint16_t legacy_opcode = 0, legacy_key_len = 0;
 
-        int rc = read_frame(fd, &frame, &payload, &is_legacy, &legacy_opcode, &legacy_key_len);
+        int rc = read_frame(fd, &frame, &payload, &payload_buf,
+                            &is_legacy, &legacy_opcode, &legacy_key_len);
         if (rc < 0) {
             /* erro ou conexão fechada */
             break;
@@ -680,9 +731,7 @@ void handle_client(int fd) {
         }
 
         /* Libera o payload do pool após o processamento */
-        if (payload != NULL) {
-            release_payload_from_ptr(payload);
-        }
+        release_payload_buf(payload_buf);
     }
 
     close(fd);
@@ -749,16 +798,25 @@ static void signal_handler(int sig) {
 static void usage(const char *prog) {
     fprintf(stderr,
             "Uso: %s [opções]\n"
-            "  --unix              Ativa socket Unix\n"
-            "  --tcp               Ativa socket TCP na porta %d\n"
-            "  --both              Ativa ambos\n"
-            "  --workers=N         Número de workers (padrão %d)\n"
-            "  --cluster-port=P    Porta de cluster (padrão %d)\n"
-            "  --peer=IP:PORT      Adiciona um peer\n"
-            "  --node-id=N         ID do nó (64-bit)\n"
-            "  --daemon            Roda como daemon (foreground se omitido)\n"
-            "  --help              Esta mensagem\n",
-            prog, PORT, DEFAULT_WORKERS, CLUSTER_PORT);
+            "  --unix                 Ativa socket Unix\n"
+            "  --tcp                  Ativa socket TCP na porta %d\n"
+            "  --both                 Ativa ambos\n"
+            "  --workers=N            Número de workers (padrão %d)\n"
+            "  --cluster-port=P       Porta de cluster (padrão %d)\n"
+            "  --peer=IP:PORT         Adiciona um peer estático\n"
+            "  --seeds=IP:PORT,...    Seeds para discovery automático\n"
+            "  --advertise=IP         Endereço anunciado ao cluster\n"
+            "  --cluster-name=NAME    Nome do cluster (isolamento)\n"
+            "  --node-id=N            ID do nó (64-bit)\n"
+            "  --daemon               Roda como daemon (foreground se omitido)\n"
+            "  --help                 Esta mensagem\n"
+            "\nVariáveis de ambiente:\n"
+            "  DMMR_CLUSTER_SEEDS      Seeds para discovery (ex: 10.0.0.1:9081)\n"
+            "  DMMR_ADVERTISE_ADDRESS  Endereço anunciado ao cluster\n"
+            "  DMMR_CLUSTER_NAME       Nome do cluster para isolamento\n"
+            "  DMMR_CACHE_PORT         Porta TCP do cache (padrão %d)\n"
+            "  DMMR_CLUSTER_PORT       Porta do cluster (padrão %d)\n",
+            prog, PORT, DEFAULT_WORKERS, CLUSTER_PORT, PORT, CLUSTER_PORT);
 }
 
 static inline void daemonize(void) {
@@ -816,8 +874,13 @@ int main(int argc, char *argv[]) {
     const char *socket_path = dmmr_env_string("DMMR_SOCKET_PATH", SOCK_PATH);
     const char *bind_address = dmmr_env_string("DMMR_BIND_ADDRESS", "127.0.0.1");
     mode_t socket_mode = (mode_t) dmmr_env_mode("DMMR_SOCKET_MODE", 0666);
+    /* Cluster discovery configuration */
+    const char *seeds = dmmr_env_string("DMMR_CLUSTER_SEEDS", "");
+    const char *advertise_address = dmmr_env_string("DMMR_ADVERTISE_ADDRESS", "");
+    const char *cluster_name_str = dmmr_env_string("DMMR_CLUSTER_NAME", "");
     pthread_t cluster_thread;
     pthread_t gc_thread;
+    pthread_t reaper_thread;
     int daemon_mode = 0;  /* 0 = foreground, 1 = daemon */
 
     worker_count = dmmr_env_int("DMMR_WORKERS", DEFAULT_WORKERS, 1, 1024);
@@ -831,6 +894,12 @@ int main(int argc, char *argv[]) {
             if (worker_count < 1) worker_count = 1;
         } else if (strncmp(argv[i], "--cluster-port=", 15) == 0) {
             cluster_port = atoi(argv[i] + 15);
+        } else if (strncmp(argv[i], "--seeds=", 8) == 0) {
+            seeds = argv[i] + 8;
+        } else if (strncmp(argv[i], "--advertise=", 12) == 0) {
+            advertise_address = argv[i] + 12;
+        } else if (strncmp(argv[i], "--cluster-name=", 15) == 0) {
+            cluster_name_str = argv[i] + 15;
         } else if (strncmp(argv[i], "--peer=", 7) == 0) {
             char *spec = argv[i] + 7;
             char *colon = strchr(spec, ':');
@@ -907,6 +976,20 @@ int main(int argc, char *argv[]) {
     if (pthread_create(&cluster_thread, NULL, cluster_listener, &cluster_port) != 0) {
         perror("pthread_create cluster");
         running = 0;
+    }
+
+    if (pthread_create(&reaper_thread, NULL, peer_reaper_thread, NULL) != 0) {
+        perror("pthread_create reaper");
+        running = 0;
+    }
+
+    /* Configurar e iniciar o discovery automático do cluster */
+    {
+        const char *adv = (advertise_address[0] != '\0') ? advertise_address : bind_address;
+        cluster_configure(adv, cluster_port, seeds, 10, cluster_name_str);
+    }
+    if (cluster_start_discovery() != 0) {
+        fprintf(stderr, "Aviso: falha ao iniciar discovery de cluster\n");
     }
 
     /* Cria sockets de escuta */
@@ -1077,6 +1160,8 @@ while (running) {
         close(cluster_listen_fd);
         cluster_listen_fd = -1;
     }
+
+    pthread_join(reaper_thread, NULL);
 
     /* Fechar conexões persistentes de cluster */
     close_peer_connections();

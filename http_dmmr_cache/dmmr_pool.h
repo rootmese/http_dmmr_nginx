@@ -12,12 +12,13 @@
  * ============================================================ */
 struct payload_buf {
     int in_use;                              /* flag de uso (0 = livre) */
-    uint8_t data[MAX_KEY_LEN + MAX_VALUE_LEN]; /* buffer de dados */
+    uint8_t *data;                           /* alocado conforme o frame */
     size_t len;                              /* tamanho efetivo dos dados */
+    size_t capacity;
     TAILQ_ENTRY(payload_buf) free_entries;
 };
 
-struct payload_buf *get_payload_buf(void);
+struct payload_buf *get_payload_buf(size_t required);
 void release_payload_buf(struct payload_buf *p);
 
 /* ============================================================
@@ -40,11 +41,12 @@ struct control_cmd_pooled {
     int type;
     uint64_t ts;
     uint64_t node_id;
+    uint64_t expire_at;
+    uint16_t flags;
     char key[MAX_KEY_LEN];
     size_t key_len;
-    uint8_t value_data[MAX_VALUE_LEN];     /* valor inline (sem ponteiro externo) */
     size_t value_len;
-    uint8_t *value;                        /* aponta para value_data ou NULL */
+    uint8_t *value;                        /* valor alocado conforme necessário */
     TAILQ_ENTRY(control_cmd_pooled) entries;
 };
 TAILQ_HEAD(control_queue_pooled, control_cmd_pooled);

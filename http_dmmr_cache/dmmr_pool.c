@@ -4,6 +4,9 @@
 
 /* Chunks keep allocated entries at stable addresses; TAILQs track free slots. */
 
+/* Keep common small requests hot without retaining arbitrarily large frames. */
+#define PAYLOAD_RETAIN_LIMIT (64U * 1024U)
+
 struct payload_chunk {
     struct payload_buf entries[POOL_INITIAL_SIZE];
     struct payload_chunk *next;
@@ -24,8 +27,12 @@ static int add_payload_chunk(void) {
     return 0;
 }
 
-struct payload_buf *get_payload_buf(void) {
+struct payload_buf *get_payload_buf(size_t required) {
     struct payload_buf *ret;
+    uint8_t *data;
+
+    if (required == 0 || required > MAX_KEY_LEN + MAX_VALUE_LEN) return NULL;
+
     pthread_mutex_lock(&payload_mutex);
     if (TAILQ_EMPTY(&payload_free) && add_payload_chunk() != 0) {
         pthread_mutex_unlock(&payload_mutex);
@@ -33,8 +40,19 @@ struct payload_buf *get_payload_buf(void) {
     }
     ret = TAILQ_FIRST(&payload_free);
     TAILQ_REMOVE(&payload_free, ret, free_entries);
+
+    if (ret->capacity < required) {
+        data = realloc(ret->data, required);
+        if (data == NULL) {
+            TAILQ_INSERT_TAIL(&payload_free, ret, free_entries);
+            pthread_mutex_unlock(&payload_mutex);
+            return NULL;
+        }
+        ret->data = data;
+        ret->capacity = required;
+    }
     ret->in_use = 1;
-    ret->len = 0;
+    ret->len = required;
     pthread_mutex_unlock(&payload_mutex);
     return ret;
 }
@@ -42,7 +60,16 @@ struct payload_buf *get_payload_buf(void) {
 void release_payload_buf(struct payload_buf *p) {
     if (p) {
         pthread_mutex_lock(&payload_mutex);
-        memset(p, 0, sizeof(*p));
+        if (p->data != NULL && p->len > 0) {
+            memset(p->data, 0, p->len);
+        }
+        if (p->capacity > PAYLOAD_RETAIN_LIMIT) {
+            free(p->data);
+            p->data = NULL;
+            p->capacity = 0;
+        }
+        p->len = 0;
+        p->in_use = 0;
         TAILQ_INSERT_TAIL(&payload_free, p, free_entries);
         pthread_mutex_unlock(&payload_mutex);
     }
@@ -123,7 +150,6 @@ struct control_cmd_pooled *get_control_cmd(void) {
     TAILQ_REMOVE(&cmd_free, ret, entries);
     memset(ret, 0, sizeof(*ret));
     ret->in_use = 1;
-    ret->value = ret->value_data;
     pthread_mutex_unlock(&cmd_pool_mutex);
     return ret;
 }
@@ -131,6 +157,10 @@ struct control_cmd_pooled *get_control_cmd(void) {
 void release_control_cmd(struct control_cmd_pooled *p) {
     if (p) {
         pthread_mutex_lock(&cmd_pool_mutex);
+        if (p->value != NULL) {
+            memset(p->value, 0, p->value_len);
+            free(p->value);
+        }
         memset(p, 0, sizeof(*p));
         TAILQ_INSERT_TAIL(&cmd_free, p, entries);
         pthread_mutex_unlock(&cmd_pool_mutex);
@@ -183,7 +213,10 @@ void release_delete_entry(struct delete_entry *p) {
 static void free_payload_chunks(void) {
     while (payload_chunks != NULL) {
         struct payload_chunk *chunk = payload_chunks;
+        unsigned i;
         payload_chunks = chunk->next;
+        for (i = 0; i < POOL_INITIAL_SIZE; ++i)
+            free(chunk->entries[i].data);
         free(chunk);
     }
 }
@@ -199,7 +232,10 @@ static void free_job_chunks(void) {
 static void free_cmd_chunks(void) {
     while (cmd_chunks != NULL) {
         struct cmd_chunk *chunk = cmd_chunks;
+        unsigned i;
         cmd_chunks = chunk->next;
+        for (i = 0; i < POOL_INITIAL_SIZE; ++i)
+            free(chunk->entries[i].value);
         free(chunk);
     }
 }

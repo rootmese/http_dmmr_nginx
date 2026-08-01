@@ -10,7 +10,8 @@ The goal is to provide a simple flow of:
 2. routing them to upstream services;
 3. authenticating them using API keys;
 4. validating keys through a local cache service;
-5. persisting keys in Berkeley DB.
+5. returning `503 Service Unavailable` when the cache cannot be reached;
+6. persisting keys in Berkeley DB.
 
 ## Components
 
@@ -28,16 +29,30 @@ The C module is responsible for:
 The process named http_dmmr_cache acts as the local access layer for keys.
 It receives requests from the Nginx module, queries the Berkeley DB store, and returns the result.
 
-The current implementation supports:
 - Unix sockets;
 - TCP;
 - or both simultaneously.
 
+It also features a distributed peer-to-peer broadcast & auto-discovery mechanism:
+- Automatic peer discovery via seed list (`--seeds` / `DMMR_CLUSTER_SEEDS`);
+- Data synchronization via `OP_SYNC` and tombstone propagation;
+- Cluster isolation using `DMMR_CLUSTER_NAME` (or `--cluster-name`), preventing unauthorized node synchronization.
+
+## Recent Implementation Highlights
+
+The cache service has been hardened in several areas:
+
+- DELETE requests now persist tombstones in Berkeley DB so removals are propagated in a consistent way across the cluster.
+- GET handling now returns the correct protocol status for missing keys, instead of surfacing them as generic errors.
+- Peer management includes a reaper for stale or dead nodes, helping avoid leaked resources and orphaned state.
+- Cluster communication validates cluster identity and supports discovery from both seeds and already-known peers.
+
 ## How Authentication Works
 
 When a request arrives with an API key, the Nginx module tries to query the cache daemon.
-If the key exists and is valid, the request is authorized.
-If there is no result, there is a fallback to static keys defined in the module itself.
+If the key exists and is valid, the request is authorized. Missing or invalid
+keys return `403`; missing credentials return `401`. There is no static-key
+fallback: a cache connection failure returns `503`.
 
 ## Example Configuration
 
@@ -54,10 +69,35 @@ location / {
 
 API keys are stored in Berkeley DB, which provides local persistence without requiring Redis.
 
+DELETE operations are represented as tombstones. Cluster replication preserves
+timestamp, node ID, expiry timestamp, and tombstone state, allowing LWW
+conflict resolution and propagation of removals.
+
+## Memory pools
+
+Pool entries and queue metadata use stable chunks. Payload buffers and queued
+replication values are allocated to the actual request/value size rather than
+reserving one MiB per entry. Payload buffers larger than 64 KiB are released
+when returned to the pool; smaller buffers may be retained for reuse.
+
+## Running the integration suite
+
+Nginx must be running with matching cache endpoints. Under systemd, use a
+shared `/run/dmmr` socket path instead of `/tmp` when `PrivateTmp=true`:
+
+```bash
+export DMMR_SOCKET_PATH=/run/dmmr/dmmr_cache.sock
+export DMMR_CLUSTER_PORT=9091
+cd tests
+python3 suite_tests.py
+```
+
+The suite currently validates 16 scenarios / 113 checks, including cache and
+backend failures, recovery, rate limiting, load, and RSS stability.
+
 ## Evolution Points
 
 The project already supports the basic cache integration, but it can still evolve in performance and robustness with:
-- persistent connections;
-- a lighter internal protocol;
-- in-memory caching;
-- shared memory integration for rate limiting.
+- non-blocking cache I/O in the Nginx module;
+- graceful shutdown of the cluster listener and active client workers;
+- shared-memory integration for rate limiting across Nginx workers.

@@ -1,11 +1,11 @@
 # Nginx DMMR API Gateway (Kong Alternative)
 
-[![Status](https://img.shields.io/badge/status-0.1.0--beta-blue.svg)]()
+[![Status](https://img.shields.io/badge/status-0.2.0--beta-blue.svg)]()
 [![License](https://img.shields.io/badge/license-BSD--2--Clause-blue.svg)](LICENSE)
 
-A native C, high-performance API gateway module for Nginx, coupled with a distributed persistence cache layer powered by Berkeley DB. The system operates on a zero-malloc request path philosophy to guarantee low-latency, event-driven API gateway routing, authentication, and rate limiting directly within Nginx worker processes.
+A native C, high-performance API gateway module for Nginx, coupled with a distributed persistence cache layer powered by Berkeley DB. The gateway performs routing, authentication, and rate limiting directly in Nginx worker processes; the cache uses stable pool metadata and demand-sized buffers to keep memory use bounded under normal traffic.
 
-> **0.1.0-beta:** the complete integration suite passes (16 tests / 112 checks).
+> **0.2.0-beta:** the complete integration suite passes (16 tests / 113 checks).
 > Cache authentication currently uses synchronous socket I/O with one-second
 > timeouts and one retry. Non-blocking, event-driven cache I/O is the highest
 > priority for the next release; it is not part of this beta.
@@ -43,7 +43,7 @@ graph TD
 
 ## ⚡ Key Architectural Principles
 
-- **Zero-Allocation Hot Path**: Memory allocations during normal request processing are done using pre-allocated static pools (e.g., job queues, payload buffers, commands) to avoid memory fragmentation and heap lock contention.
+- **Bounded Pool Metadata, Demand-Sized Buffers**: queue metadata is pooled in stable chunks. Payload and replication-value buffers are allocated only for the received value; buffers larger than 64 KiB are released when returned to the payload pool.
 - **Patricia Trie Rate Limiter**: Implemented in-memory locally within the Nginx worker processes, eliminating external dependencies like Redis.
 - **Eventual Consistency**: Peer-to-peer sync via background replication commands (`OP_SYNC`).
 - **Deterministic Routing**: Priority-based path, method, and host matching.
@@ -54,7 +54,7 @@ graph TD
 
 - `nginx-dmmr-module-c/` - Core Nginx HTTP Gateway module source files.
 - `http_dmmr_cache/` - High-performance cache microservice with Berkeley DB persistence.
-- `python/` - Test scripts and client tools.
+- `tests/` - Integration test suite and test client helpers.
 
 ---
 
@@ -84,6 +84,15 @@ make release
 # Build debug target (adds logging, compiles with -O0 -g3 -DDEBUG)
 make debug
 ```
+
+### Recent Implementation Highlights
+
+The cache daemon now covers a broader set of correctness and operational concerns:
+
+- DELETE operations are persisted as tombstones in Berkeley DB and propagated through the cluster.
+- GET requests map Berkeley DB not-found results to the protocol not-found status instead of falling back to a generic error.
+- Cluster peers are reaped when they become stale or unreachable, preventing leaked connections and stale state.
+- Cluster frames are validated with cluster identity checks, and discovery can recover from known peers as well as seed nodes.
 
 ### Run Options
 
@@ -178,13 +187,28 @@ The runtime settings may be overridden without rebuilding:
 
 ```bash
 DMMR_BIND_ADDRESS=0.0.0.0 DMMR_CACHE_PORT=9080 \
+DMMR_CLUSTER_NAME=prod DMMR_CLUSTER_SEEDS=10.0.0.1:9081 \
 DMMR_DB_PATH=/data/apikeys.db DMMR_WORKERS=4 ./dmmr_cache --tcp
 ```
 
 Supported variables are `DMMR_BIND_ADDRESS`, `DMMR_CACHE_PORT`,
-`DMMR_CLUSTER_PORT`, `DMMR_DB_PATH`, `DMMR_WORKERS`, `DMMR_SOCKET_PATH`, and
+`DMMR_CLUSTER_PORT`, `DMMR_CLUSTER_SEEDS`, `DMMR_ADVERTISE_ADDRESS`, `DMMR_CLUSTER_NAME`,
+`DMMR_DB_PATH`, `DMMR_WORKERS`, `DMMR_SOCKET_PATH`, and
 `DMMR_SOCKET_MODE` (octal, for example `0660`). Command-line options override
-the worker count and cluster port settings.
+the worker count, cluster options, and port settings.
+
+### Cluster Broadcast & Auto-Discovery
+
+Nodes in a cluster automatically discover peers via seed nodes and replicate updates (`OP_SET`, `OP_DEL`, `OP_SYNC`).
+Cluster isolation is guaranteed by `DMMR_CLUSTER_NAME` (or `--cluster-name`): nodes with mismatching cluster names reject synchronization during the `OP_CLUSTER_HELLO` handshake.
+
+```bash
+# Node 1 (Seed)
+./dmmr_cache --tcp --cluster-name=production --advertise=10.0.0.1 --cluster-port=9091
+
+# Node 2 (Connects to Seed)
+./dmmr_cache --tcp --cluster-name=production --advertise=10.0.0.2 --cluster-port=9091 --seeds=10.0.0.1:9091
+```
 
 ---
 
@@ -200,13 +224,18 @@ Every modern request/response frame header is exactly **24 bytes** long. Fields 
 | :--- | :--- | :--- | :--- |
 | `0 - 1` | `magic` | `uint16_t` | Protocol magic indicator (`0xD4D4`) |
 | `2 - 3` | `version` | `uint16_t` | Protocol version (`1`) |
-| `4 - 5` | `opcode` | `uint16_t` | Operation code: `1=GET`, `2=SET`, `3=DEL`, `4=SYNC` |
+| `4 - 5` | `opcode` | `uint16_t` | `1=GET`, `2=SET`, `3=DEL`; `4=SYNC` is used by replication; `10=PING`, `11=STATUS`, `12=STATS` are diagnostic operations |
 | `6 - 7` | `flags` | `uint16_t` | Flags: `1` if request originates from a cluster peer |
 | `8 - 11` | `key_len` | `uint32_t` | Length of the key in bytes |
 | `12 - 15` | `value_len` | `uint32_t` | Length of the value in bytes (0 for `GET`/`DEL`) |
 | `16 - 23` | `timestamp` | `uint64_t` | Epoch timestamp in microseconds |
 
 *Following the header, the payload is transmitted sequentially: `Key Data` (size: `key_len`) + `Value Data` (size: `value_len`).*
+
+Cluster traffic uses a separate version-3 frame that includes `node_id`,
+`expire_at`, and a cluster-name-derived identity. This preserves the public
+version-1 cache protocol while allowing peers to replicate LWW metadata,
+TTL, and tombstones.
 
 ### 2. Legacy Request Format
 
@@ -299,23 +328,26 @@ http {
 
 ## 🧪 Testing Suite
 
-A suite of verification scripts is stored under `python/`.
+The integration suite is stored under `tests/`. It starts its own cache and
+two local backends; Nginx must already be running with the DMMR module loaded.
 
 ### Automated Integration Tests
 
 To run automated checks that validate both modern and legacy protocol interactions:
 ```bash
-python3 python/test_cache_suite.py
+cd tests
+python3 suite_tests.py
 ```
 
-Expected output:
-```
-Executando Teste SET & GET (Protocolo Moderno)... [OK]
-Executando Teste DEL & GET (Protocolo Moderno)... [OK]
-Executando Teste GET (Protocolo Legado)... [OK]
+The suite covers listener modes, modern and legacy protocols, malformed input,
+authentication, routing, upstream/cache failures, recovery, 60-second RSS
+stability, rate limiting, and a 20×50-request load simulation.
 
-Todos os testes passaram com sucesso!
-```
+### Beta operating note
+
+The current daemon has a known graceful-shutdown limitation: its cluster
+listener can remain blocked in `accept()` until forcibly terminated. Do not
+claim zero-downtime restarts until that shutdown path is corrected and tested.
 
 ---
 

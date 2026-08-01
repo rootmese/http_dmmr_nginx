@@ -191,6 +191,8 @@ ngx_http_dmmr_rate_insert_node(ngx_http_request_t *r, ngx_str_t *key,
 
 ngx_int_t ngx_http_dmmr_rate_init(ngx_cycle_t *cycle)
 {
+    (void) cycle;
+
     rate_root = NULL;
     return NGX_OK;
 }

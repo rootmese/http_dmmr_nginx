@@ -647,6 +647,13 @@ class DMMRTestSuite(BaseIntegrationTest):
         cls.backend_mgr.start_all()
         cls.cache_mgr.start(['--unix', '--tcp'])
 
+        client = CacheClient(use_unix=True)
+        for key, value in ((b'123456', b'user1'), (b'abcdef', b'user2'), (b'987654', b'admin')):
+            status, _ = client.send_frame(OP_SET, key, value)
+            if status != 0:
+                raise RuntimeError(f'Failed to seed auth key {key.decode("utf-8", "ignore")}, status={status}')
+        LOG.ok('Seeded authentication keys into cache.')
+
         LOG.info('Checking Nginx availability...')
         for port in (CFG.NGINX_TCP_PORT, CFG.NGINX_UNIX_PORT):
             if not _wait_for_http(f'http://127.0.0.1:{port}/', timeout=3):

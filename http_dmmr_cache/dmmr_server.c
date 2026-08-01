@@ -5,6 +5,7 @@
 #include "dmmr_db.h"
 #include "dmmr_cluster.h"
 #include "dmmr_pool.h"
+#include "dmmr_heap_pool.h"
 #include "dmmr_string.h"
 #include <stdio.h>
 #include <stdlib.h>
@@ -29,7 +30,47 @@
 extern int cluster_listen_fd;
 
 /* ============================================================
- * Fila de controle (broadcast)  –  usa control_cmd_pooled do pool
+ * Estruturas de tamanho fixo (definidas localmente)
+ * ============================================================ */
+struct job_fd_entry {
+    int fd;
+    TAILQ_ENTRY(job_fd_entry) entries;
+};
+
+struct control_cmd_pooled {
+    int       in_use;
+    int       type;
+    uint64_t  ts;
+    uint64_t  node_id;
+    uint64_t  expire_at;
+    uint16_t  flags;
+    char      key[MAX_KEY_LEN];
+    size_t    key_len;
+    uint8_t  *value;
+    size_t    value_len;
+    TAILQ_ENTRY(control_cmd_pooled) entries;
+};
+
+struct delete_entry {
+    int    in_use;
+    char   key[MAX_KEY_LEN];
+    size_t key_len;
+    TAILQ_ENTRY(delete_entry) entries;
+};
+
+TAILQ_HEAD(control_queue_pooled, control_cmd_pooled);
+TAILQ_HEAD(delete_queue, delete_entry);
+TAILQ_HEAD(job_fd_queue, job_fd_entry);
+
+/* ============================================================
+ * Pools de objetos de tamanho fixo (heap pool)
+ * ============================================================ */
+static dmmr_heap_pool_t job_pool;   // capacidade = QUEUE_MAX
+static dmmr_heap_pool_t cmd_pool;   // capacidade = QUEUE_MAX * 2
+static dmmr_heap_pool_t del_pool;   // capacidade = TTL_SCAN_CHUNK_SIZE * 4
+
+/* ============================================================
+ * Fila de controle (broadcast)
  * ============================================================ */
 pthread_mutex_t control_mutex = PTHREAD_MUTEX_INITIALIZER;
 pthread_cond_t control_cond = PTHREAD_COND_INITIALIZER;
@@ -52,62 +93,9 @@ static uint64_t cache_miss_count = 0;
 static uint64_t cache_set_count = 0;
 static uint64_t cache_del_count = 0;
 
-void enqueue_broadcast(const char *key, size_t key_len,
-                       const void *value, size_t value_len,
-                       uint64_t ts, uint64_t node_id,
-                       uint64_t expire_at, uint16_t flags);
-
 /* ============================================================
- * Fila de jobs  –  usa job_pool_entry do pool
+ * Fila de jobs
  * ============================================================ */
-struct job_queue_entry {
-    struct job_pool_entry *pool_ref;   /* ponteiro para a entrada do pool */
-    TAILQ_ENTRY(job_queue_entry) entries;
-};
-TAILQ_HEAD(job_queue_head, job_queue_entry);
-
-/* Precisamos de uma fila TAILQ com ponteiros para pool entries.
- * Porém, para evitar malloc na fila, usamos índices.
- * Abordagem simplificada: a job_queue continua com TAILQ mas as
- * entradas vêm do pool de jobs e mantemos o fd inline. */
-
-/* Fila de jobs simplificada: armazenamos fds diretamente */
-struct job_fd_entry {
-    int fd;
-    TAILQ_ENTRY(job_fd_entry) entries;
-};
-TAILQ_HEAD(job_fd_queue, job_fd_entry);
-
-/* Pool estático para job_fd_entry (evita malloc nos enqueue de fila) */
-static struct job_fd_entry job_fd_pool_storage[QUEUE_MAX];
-static int job_fd_pool_used[QUEUE_MAX];
-static pthread_mutex_t job_fd_pool_lock = PTHREAD_MUTEX_INITIALIZER;
-
-static struct job_fd_entry *get_job_fd(void) {
-    pthread_mutex_lock(&job_fd_pool_lock);
-    for (int i = 0; i < QUEUE_MAX; i++) {
-        if (job_fd_pool_used[i] == 0) {
-            job_fd_pool_used[i] = 1;
-            job_fd_pool_storage[i].fd = -1;
-            pthread_mutex_unlock(&job_fd_pool_lock);
-            return &job_fd_pool_storage[i];
-        }
-    }
-    pthread_mutex_unlock(&job_fd_pool_lock);
-    return NULL;  /* fila cheia */
-}
-
-static void release_job_fd(struct job_fd_entry *p) {
-    if (!p) return;
-    pthread_mutex_lock(&job_fd_pool_lock);
-    int idx = (int)(p - job_fd_pool_storage);
-    if (idx >= 0 && idx < QUEUE_MAX) {
-        job_fd_pool_used[idx] = 0;
-        p->fd = -1;
-    }
-    pthread_mutex_unlock(&job_fd_pool_lock);
-}
-
 struct job_fd_queue queue_head;
 pthread_mutex_t queue_mutex = PTHREAD_MUTEX_INITIALIZER;
 pthread_cond_t queue_cond = PTHREAD_COND_INITIALIZER;
@@ -116,15 +104,42 @@ int worker_count = DEFAULT_WORKERS;
 pthread_t *worker_threads = NULL;
 
 /* ============================================================
- * Garbage Collector – fila de chaves pendentes para exclusão
+ * Garbage Collector
  * ============================================================ */
 struct delete_queue gc_queue;
 pthread_mutex_t gc_mutex = PTHREAD_MUTEX_INITIALIZER;
 pthread_cond_t gc_cond = PTHREAD_COND_INITIALIZER;
-
-/* Cursor persistente para TTL scan */
 static DBC *gc_cursor = NULL;
 static pthread_mutex_t gc_cursor_mutex = PTHREAD_MUTEX_INITIALIZER;
+
+/* ============================================================
+ * Funções auxiliares para os pools fixos
+ * ============================================================ */
+static struct job_fd_entry *alloc_job(void) {
+    return (struct job_fd_entry *)dmmr_heap_pool_alloc(&job_pool);
+}
+static void free_job(struct job_fd_entry *j) {
+    dmmr_heap_pool_free(&job_pool, j);
+}
+
+static struct control_cmd_pooled *alloc_cmd(void) {
+    return (struct control_cmd_pooled *)dmmr_heap_pool_alloc(&cmd_pool);
+}
+static void free_cmd(struct control_cmd_pooled *c) {
+    if (c) {
+        free(c->value);
+        c->value = NULL;
+        c->value_len = 0;
+        dmmr_heap_pool_free(&cmd_pool, c);
+    }
+}
+
+static struct delete_entry *alloc_del(void) {
+    return (struct delete_entry *)dmmr_heap_pool_alloc(&del_pool);
+}
+static void free_del(struct delete_entry *d) {
+    dmmr_heap_pool_free(&del_pool, d);
+}
 
 /* ============================================================
  * Protótipos estáticos
@@ -135,8 +150,9 @@ static void handle_client(int fd);
 static void send_legacy_response(int fd, uint16_t status, uint16_t payload_len, const void *payload);
 static int process_legacy_request(int fd, uint16_t opcode, uint16_t key_len, const uint8_t *payload);
 static void *gc_worker_routine(void *arg);
+static void enqueue_broadcast(const char *key, size_t key_len, const void *value, size_t value_len, uint64_t ts, uint64_t node_id, uint64_t expire_at, uint16_t flags);
 
-/* ---------- Implementação das funções ---------- */
+/* ---------- Implementação ---------- */
 
 void send_legacy_response(int fd, uint16_t status, uint16_t payload_len, const void *payload) {
     uint8_t resp[4 + 4096];
@@ -144,42 +160,30 @@ void send_legacy_response(int fd, uint16_t status, uint16_t payload_len, const v
     uint16_t net_payload_len = htons(payload_len);
     memcpy(resp, &net_status, sizeof(net_status));
     memcpy(resp + sizeof(net_status), &net_payload_len, sizeof(net_payload_len));
-    if (payload_len > 0 && payload != NULL) {
+    if (payload_len > 0 && payload != NULL)
         memcpy(resp + 4, payload, payload_len);
-    }
     send_full(fd, resp, 4 + payload_len, 0);
 }
 
 static void process_control_cmd(struct control_cmd_pooled *cmd) {
     switch (cmd->type) {
         case CMD_BROADCAST:
-            broadcast_sync(cmd->key, cmd->key_len,
-                           cmd->value, cmd->value_len,
+            broadcast_sync(cmd->key, cmd->key_len, cmd->value, cmd->value_len,
                            cmd->ts, cmd->node_id, cmd->expire_at, cmd->flags);
             break;
         case CMD_SHUTDOWN:
-            // já tratado pelo running
             break;
         default:
             break;
     }
 }
 
-/* ============================================================
- * (A) TTL Scan Incremental com Cursor Persistente
- * ============================================================
- * Em vez de varrer o banco inteiro, percorre TTL_SCAN_CHUNK_SIZE
- * chaves por ciclo. Registros expirados são enfileirados na
- * gc_queue para exclusão assíncrona pela thread GC.
- */
 static void scan_expired_entries(void) {
     DBT key, data;
     int count = 0;
     uint64_t now = now_micros();
 
     pthread_mutex_lock(&gc_cursor_mutex);
-
-    /* Criar cursor persistente na primeira chamada */
     if (gc_cursor == NULL) {
         int ret = dbp->cursor(dbp, NULL, &gc_cursor, 0);
         if (ret != 0) {
@@ -195,35 +199,27 @@ static void scan_expired_entries(void) {
     while (count < TTL_SCAN_CHUNK_SIZE) {
         int ret = gc_cursor->get(gc_cursor, &key, &data, DB_NEXT);
         if (ret == DB_NOTFOUND) {
-            /* Fim do banco: reposicionar no início (varredura circular) */
             memset(&key, 0, sizeof(key));
             memset(&data, 0, sizeof(data));
             data.flags = DB_DBT_MALLOC;
             ret = gc_cursor->get(gc_cursor, &key, &data, DB_FIRST);
-            if (ret != 0) {
-                /* Banco vazio ou erro */
-                break;
-            }
+            if (ret != 0) break;
         } else if (ret != 0) {
-            /* Erro inesperado: recriar cursor na próxima chamada */
             gc_cursor->close(gc_cursor);
             gc_cursor = NULL;
             break;
         }
 
         count++;
-
         if (data.size >= sizeof(struct cache_entry)) {
             struct cache_entry *entry = (struct cache_entry *)data.data;
             if (entry->expire_at < now) {
-                /* Marcar para exclusão: enfileirar na gc_queue */
-                struct delete_entry *de = get_delete_entry();
+                struct delete_entry *de = alloc_del();
                 if (de) {
                     size_t klen = key.size;
                     if (klen > MAX_KEY_LEN) klen = MAX_KEY_LEN;
                     memcpy(de->key, key.data, klen);
                     de->key_len = klen;
-
                     pthread_mutex_lock(&gc_mutex);
                     TAILQ_INSERT_TAIL(&gc_queue, de, entries);
                     pthread_cond_signal(&gc_cond);
@@ -231,28 +227,18 @@ static void scan_expired_entries(void) {
                 }
             }
         }
-
-        if (data.data) {
-            free(data.data);
-        }
+        if (data.data) free(data.data);
         memset(&key, 0, sizeof(key));
         memset(&data, 0, sizeof(data));
         data.flags = DB_DBT_MALLOC;
     }
-
     pthread_mutex_unlock(&gc_cursor_mutex);
 }
 
-/* ============================================================
- * Thread Garbage Collector – exclusão física assíncrona
- * ============================================================ */
 static void *gc_worker_routine(void *arg) {
     (void)arg;
-
     while (running) {
         pthread_mutex_lock(&gc_mutex);
-
-        /* Aguardar entradas ou timeout */
         while (TAILQ_EMPTY(&gc_queue) && running) {
             struct timespec ts;
             clock_gettime(CLOCK_REALTIME, &ts);
@@ -263,34 +249,22 @@ static void *gc_worker_routine(void *arg) {
             }
             pthread_cond_timedwait(&gc_cond, &gc_mutex, &ts);
         }
-
         if (!running && TAILQ_EMPTY(&gc_queue)) {
             pthread_mutex_unlock(&gc_mutex);
             break;
         }
-
-        /* Drenar a fila */
         struct delete_entry *de;
         while ((de = TAILQ_FIRST(&gc_queue)) != NULL) {
             TAILQ_REMOVE(&gc_queue, de, entries);
             pthread_mutex_unlock(&gc_mutex);
-
-            /* Exclusão física do banco */
             db_del_key(de->key, de->key_len);
-
-            /* Enfileirar broadcast de DEL com tombstone */
             uint64_t ts_now = now_micros();
-            enqueue_broadcast((const char *)de->key, de->key_len,
-                              NULL, 0, ts_now, my_node_id, 0, FLAG_TOMBSTONE);
-
-            release_delete_entry(de);
-
+            enqueue_broadcast((const char *)de->key, de->key_len, NULL, 0, ts_now, my_node_id, 0, FLAG_TOMBSTONE);
+            free_del(de);
             pthread_mutex_lock(&gc_mutex);
         }
-
         pthread_mutex_unlock(&gc_mutex);
     }
-
     return NULL;
 }
 
@@ -298,25 +272,21 @@ static void *broadcast_worker_routine(void *arg) {
     (void)arg;
     while (running) {
         pthread_mutex_lock(&control_mutex);
-        /* Só processa se a fila estiver acima do HIGH */
-        while (control_queue_size <= HIGH_WATERMARK && running) {
+        while (control_queue_size <= HIGH_WATERMARK && running)
             pthread_cond_wait(&broadcast_cond, &control_mutex);
-        }
         if (!running) {
             pthread_mutex_unlock(&control_mutex);
             break;
         }
-        /* Pega um comando */
         struct control_cmd_pooled *cmd = TAILQ_FIRST(&control_head);
         if (cmd) {
             TAILQ_REMOVE(&control_head, cmd, entries);
             control_queue_size--;
         }
         pthread_mutex_unlock(&control_mutex);
-
         if (cmd) {
             process_control_cmd(cmd);
-            release_control_cmd(cmd);
+            free_cmd(cmd);
         }
     }
     return NULL;
@@ -327,117 +297,72 @@ static void *control_thread_routine(void *arg) {
     time_t last_scan = 0;
 
     while (running) {
-        /* =====================================================
-         * 1. Aguarda comandos ou timeout para TTL scan
-         * ===================================================== */
         pthread_mutex_lock(&control_mutex);
-
-        /* Enquanto a fila estiver vazia e o sistema estiver rodando, espera */
         while (TAILQ_EMPTY(&control_head) && running) {
             struct timespec ts;
             clock_gettime(CLOCK_REALTIME, &ts);
-            ts.tv_sec += 5;   // timeout de 5 segundos para escanear TTL
+            ts.tv_sec += 5;
             pthread_cond_timedwait(&control_cond, &control_mutex, &ts);
-            break;  /* sai para verificar TTL mesmo sem comando */
+            break;
         }
-
-        /* Se o sistema foi desligado, sai */
         if (!running) {
             pthread_mutex_unlock(&control_mutex);
             break;
         }
-
-        /* =====================================================
-         * 2. Processa comandos da fila
-         * ===================================================== */
         struct control_cmd_pooled *cmd = TAILQ_FIRST(&control_head);
         if (cmd) {
             TAILQ_REMOVE(&control_head, cmd, entries);
             control_queue_size--;
             pthread_mutex_unlock(&control_mutex);
-
-            /* Processa o comando (broadcast, etc.) */
             process_control_cmd(cmd);
-            release_control_cmd(cmd);
-
-            /* Após processar, verificamos se a fila ainda está grande
-             * e acordamos os workers de broadcast se necessário */
+            free_cmd(cmd);
             pthread_mutex_lock(&control_mutex);
-            if (control_queue_size > HIGH_WATERMARK) {
+            if (control_queue_size > HIGH_WATERMARK)
                 pthread_cond_broadcast(&broadcast_cond);
-            }
             pthread_mutex_unlock(&control_mutex);
         } else {
-            /* Fila vazia (timeout ocorreu) */
             pthread_mutex_unlock(&control_mutex);
         }
-
-        /* =====================================================
-         * 3. Escaneia entradas expiradas (TTL) a cada 5 segundos
-         *    Agora com cursor persistente e scan incremental
-         * ===================================================== */
         time_t now = time(NULL);
         if (now - last_scan >= 5) {
             last_scan = now;
             scan_expired_entries();
         }
-
-        /* =====================================================
-         * 4. Gerencia os workers de broadcast com histerese
-         * ===================================================== */
         pthread_mutex_lock(&control_mutex);
         int qsize = control_queue_size;
         pthread_mutex_unlock(&control_mutex);
-
-        if (qsize > HIGH_WATERMARK) {
-            /* Se a fila está cheia, acorda os workers (se estiverem dormindo) */
+        if (qsize > HIGH_WATERMARK)
             pthread_cond_broadcast(&broadcast_cond);
-        }
-        /* Nota: a condição de espera dos workers já verifica qsize,
-         * então eles vão dormir sozinhos quando a fila estiver baixa. */
     }
-
     return NULL;
 }
 
-/* ============================================================
- * enqueue_broadcast – usa pool em vez de malloc
- * ============================================================ */
 void enqueue_broadcast(const char *key, size_t key_len,
                        const void *value, size_t value_len,
                        uint64_t ts, uint64_t node_id,
                        uint64_t expire_at, uint16_t flags) {
-    struct control_cmd_pooled *cmd = get_control_cmd();
+    struct control_cmd_pooled *cmd = alloc_cmd();
     if (!cmd) return;
-
     cmd->type = CMD_BROADCAST;
     cmd->ts = ts;
     cmd->node_id = node_id;
     cmd->expire_at = expire_at;
     cmd->flags = flags;
-
-    /* Copiar chave inline */
     size_t klen = key_len;
     if (klen > MAX_KEY_LEN) klen = MAX_KEY_LEN;
     memcpy(cmd->key, key, klen);
     cmd->key_len = klen;
-
-    /* Copiar somente o valor efetivamente recebido. */
     if (value && value_len > 0) {
         size_t vlen = value_len;
         if (vlen > MAX_VALUE_LEN) vlen = MAX_VALUE_LEN;
         cmd->value = malloc(vlen);
-        if (cmd->value == NULL) {
-            release_control_cmd(cmd);
-            return;
-        }
+        if (!cmd->value) { free_cmd(cmd); return; }
         memcpy(cmd->value, value, vlen);
         cmd->value_len = vlen;
     } else {
         cmd->value = NULL;
         cmd->value_len = 0;
     }
-
     pthread_mutex_lock(&control_mutex);
     TAILQ_INSERT_TAIL(&control_head, cmd, entries);
     control_queue_size++;
@@ -445,26 +370,19 @@ void enqueue_broadcast(const char *key, size_t key_len,
     pthread_mutex_unlock(&control_mutex);
 }
 
-/* ============================================================
- * process_frame – corrigido para nova assinatura de db_get_with_meta
- * ============================================================ */
 int process_frame(int fd, struct dmmr_frame *frame, const uint8_t *payload,
                   uint64_t source_node_id, bool from_peer) {
     uint16_t opcode = frame->opcode;
-    uint16_t flags = frame->flags;
     uint32_t key_len = frame->key_len;
     uint32_t value_len = frame->value_len;
     uint64_t ts = frame->timestamp;
+    (void)frame->flags;
 
-    (void)flags;   /* suprime warning de variável não usada */
-
-    if (key_len == 0 || key_len > MAX_KEY_LEN || value_len > MAX_VALUE_LEN) {
+    if (key_len == 0 || key_len > MAX_KEY_LEN || value_len > MAX_VALUE_LEN)
         return -1;
-    }
 
     const char *key = (const char *) payload;
     const void *value = (value_len > 0) ? (payload + key_len) : NULL;
-
     uint16_t status = DMMR_PROTO_STATUS_ERROR;
     uint8_t *response_payload = NULL;
     uint32_t response_len = 0;
@@ -491,54 +409,10 @@ int process_frame(int fd, struct dmmr_frame *frame, const uint8_t *payload,
             }
             break;
         }
-        case OP_PING: {
-            const char *pong = "pong";
-            response_payload = malloc(strlen(pong) + 1);
-            if (response_payload != NULL) {
-                memcpy(response_payload, pong, strlen(pong) + 1);
-                response_len = (uint32_t) strlen(pong);
-            }
-            status = DMMR_PROTO_STATUS_OK;
-            break;
-        }
-        case OP_STATUS: {
-            const char *status_payload = "ok";
-            response_payload = malloc(strlen(status_payload) + 1);
-            if (response_payload != NULL) {
-                memcpy(response_payload, status_payload, strlen(status_payload) + 1);
-                response_len = (uint32_t) strlen(status_payload);
-            }
-            status = DMMR_PROTO_STATUS_OK;
-            break;
-        }
-        case OP_STATS: {
-            char stats_payload[256];
-            int written = snprintf(stats_payload, sizeof(stats_payload),
-                                   "requests=%llu hits=%llu misses=%llu sets=%llu deletes=%llu",
-                                   (unsigned long long) cache_request_count,
-                                   (unsigned long long) cache_hit_count,
-                                   (unsigned long long) cache_miss_count,
-                                   (unsigned long long) cache_set_count,
-                                   (unsigned long long) cache_del_count);
-            if (written > 0) {
-                response_payload = malloc((size_t) written + 1);
-                if (response_payload != NULL) {
-                    memcpy(response_payload, stats_payload, (size_t) written + 1);
-                    response_len = (uint32_t) written;
-                }
-            }
-            status = DMMR_PROTO_STATUS_OK;
-            break;
-        }
         case OP_SET:
         case OP_SYNC: {
-            DMMR_LOG_DEBUG("process_frame: %s key='%.*s', value_len=%u", (opcode == OP_SET ? "OP_SET" : "OP_SYNC"), (int)key_len, key, value_len);
-            /*
-            if (value_len == 0) {
-                status = DMMR_PROTO_STATUS_ERROR;
-                break;
-            }
-            */
+            DMMR_LOG_DEBUG("process_frame: %s key='%.*s', value_len=%u",
+                           (opcode == OP_SET ? "OP_SET" : "OP_SYNC"), (int)key_len, key, value_len);
             uint64_t ts_use = ts;
             uint64_t node_use = source_node_id;
             if (!from_peer) {
@@ -551,9 +425,8 @@ int process_frame(int fd, struct dmmr_frame *frame, const uint8_t *payload,
             int rc = db_set_with_meta(key, key_len, ts_use, node_use, value, value_len, expire_at);
             if (rc == 0) {
                 status = DMMR_PROTO_STATUS_OK;
-                if(!from_peer)
-                    enqueue_broadcast(key, key_len, value, value_len,
-                                      ts_use, node_use, expire_at, FLAG_NONE);
+                if (!from_peer)
+                    enqueue_broadcast(key, key_len, value, value_len, ts_use, node_use, expire_at, FLAG_NONE);
             }
             break;
         }
@@ -567,8 +440,7 @@ int process_frame(int fd, struct dmmr_frame *frame, const uint8_t *payload,
             }
             if (!from_peer) {
                 uint64_t ts_del = now_micros();
-                enqueue_broadcast(key, key_len, NULL, 0, ts_del, my_node_id,
-                                  0, FLAG_TOMBSTONE);
+                enqueue_broadcast(key, key_len, NULL, 0, ts_del, my_node_id, 0, FLAG_TOMBSTONE);
             }
             break;
         }
@@ -598,18 +470,14 @@ int process_frame(int fd, struct dmmr_frame *frame, const uint8_t *payload,
     return 0;
 }
 
-/* ============================================================
- * read_frame – usa pool de payload_buf em vez de malloc
- * ============================================================ */
 int read_frame(int fd, struct dmmr_frame *frame, uint8_t **payload,
                struct payload_buf **payload_buf,
                bool *is_legacy, uint16_t *legacy_opcode, uint16_t *legacy_key_len) {
     uint8_t prefix[4];
     *payload = NULL;
     *payload_buf = NULL;
-    if (recv_full(fd, prefix, sizeof(prefix), 0) != (ssize_t) sizeof(prefix)) {
+    if (recv_full(fd, prefix, sizeof(prefix), 0) != (ssize_t) sizeof(prefix))
         return -1;
-    }
 
     uint16_t magic = ntohs(*(uint16_t *) prefix);
     uint16_t version = ntohs(*(uint16_t *) (prefix + 2));
@@ -617,9 +485,8 @@ int read_frame(int fd, struct dmmr_frame *frame, uint8_t **payload,
     if (magic == DMMR_MAGIC && version == DMMR_VERSION) {
         *is_legacy = false;
         memcpy(frame, prefix, sizeof(prefix));
-        if (recv_full(fd, ((uint8_t *) frame) + 4, sizeof(*frame) - 4, 0) != (ssize_t) (sizeof(*frame) - 4)) {
+        if (recv_full(fd, ((uint8_t *) frame) + 4, sizeof(*frame) - 4, 0) != (ssize_t)(sizeof(*frame) - 4))
             return -1;
-        }
         frame->magic = ntohs(frame->magic);
         frame->version = ntohs(frame->version);
         frame->opcode = ntohs(frame->opcode);
@@ -628,28 +495,17 @@ int read_frame(int fd, struct dmmr_frame *frame, uint8_t **payload,
         frame->value_len = ntohl(frame->value_len);
         frame->timestamp = ntohll(frame->timestamp);
 
-        if (frame->magic != DMMR_MAGIC || frame->version != DMMR_VERSION) {
-            return -2;
-        }
-        if (frame->key_len > MAX_KEY_LEN || frame->value_len > MAX_VALUE_LEN) {
-            return -3;
-        }
+        if (frame->magic != DMMR_MAGIC || frame->version != DMMR_VERSION) return -2;
+        if (frame->key_len > MAX_KEY_LEN || frame->value_len > MAX_VALUE_LEN) return -3;
 
-        size_t total_payload = frame->key_len + frame->value_len;
-        if (total_payload == 0) {
-            *payload = NULL;
-            return 0;
-        }
+        size_t total = frame->key_len + frame->value_len;
+        if (total == 0) return 0;
 
-        /* Usa pool de payload_buf em vez de malloc */
-        struct payload_buf *pbuf = get_payload_buf(total_payload);
-        if (pbuf == NULL) {
-            return -4;
-        }
+        struct payload_buf *pbuf = get_payload_buf(total);
+        if (!pbuf) return -4;
         *payload = pbuf->data;
         *payload_buf = pbuf;
-
-        if (recv_full(fd, *payload, total_payload, 0) != (ssize_t) total_payload) {
+        if (recv_full(fd, *payload, total, 0) != (ssize_t)total) {
             release_payload_buf(pbuf);
             *payload = NULL;
             *payload_buf = NULL;
@@ -662,20 +518,14 @@ int read_frame(int fd, struct dmmr_frame *frame, uint8_t **payload,
     *legacy_opcode = ntohs(*(uint16_t *) prefix);
     *legacy_key_len = ntohs(*(uint16_t *) (prefix + 2));
 
-    if (*legacy_opcode != DMMR_PROTO_OP_GET || *legacy_key_len == 0) {
-        *payload = NULL;
+    if (*legacy_opcode != DMMR_PROTO_OP_GET || *legacy_key_len == 0)
         return 0;
-    }
 
-    /* Usa pool de payload_buf em vez de malloc */
     struct payload_buf *pbuf = get_payload_buf(*legacy_key_len);
-    if (pbuf == NULL) {
-        return -4;
-    }
+    if (!pbuf) return -4;
     *payload = pbuf->data;
     *payload_buf = pbuf;
-
-    if (recv_full(fd, *payload, *legacy_key_len, 0) != (ssize_t) *legacy_key_len) {
+    if (recv_full(fd, *payload, *legacy_key_len, 0) != (ssize_t)*legacy_key_len) {
         release_payload_buf(pbuf);
         *payload = NULL;
         *payload_buf = NULL;
@@ -689,13 +539,11 @@ int process_legacy_request(int fd, uint16_t opcode, uint16_t key_len, const uint
         send_legacy_response(fd, DMMR_PROTO_STATUS_ERROR, 0, NULL);
         return -1;
     }
-
     DMMR_LOG_DEBUG("process_legacy_request: OP_GET legacy key='%.*s'", (int)key_len, payload);
     uint64_t ts_found = 0, node_found = 0, expire_at = 0;
     void *value = NULL;
     size_t value_len = 0;
     int rc = db_get_with_meta((const char *) payload, key_len, &ts_found, &node_found, &value, &value_len, &expire_at);
-
     if (rc == 0) {
         send_legacy_response(fd, DMMR_PROTO_STATUS_OK, (uint16_t) value_len, value);
         free(value);
@@ -713,49 +561,36 @@ void handle_client(int fd) {
     while (1) {
         struct dmmr_frame frame;
         uint8_t *payload = NULL;
-        struct payload_buf *payload_buf = NULL;
+        struct payload_buf *pbuf = NULL;
         bool is_legacy = false;
         uint16_t legacy_opcode = 0, legacy_key_len = 0;
 
-        int rc = read_frame(fd, &frame, &payload, &payload_buf,
-                            &is_legacy, &legacy_opcode, &legacy_key_len);
-        if (rc < 0) {
-            /* erro ou conexão fechada */
-            break;
-        }
+        int rc = read_frame(fd, &frame, &payload, &pbuf, &is_legacy, &legacy_opcode, &legacy_key_len);
+        if (rc < 0) break;
 
-        if (is_legacy) {
+        if (is_legacy)
             process_legacy_request(fd, legacy_opcode, legacy_key_len, payload);
-        } else {
+        else
             process_frame(fd, &frame, payload, my_node_id, false);
-        }
-
-        /* Libera o payload do pool após o processamento */
-        release_payload_buf(payload_buf);
+        release_payload_buf(pbuf);
     }
-
     close(fd);
 }
-/* ============================================================
- * enqueue_job / worker – usam pool estático de job_fd
- * ============================================================ */
+
 void enqueue_job(int fd) {
     if (fd < 0) return;
-
     pthread_mutex_lock(&queue_mutex);
     if (queue_size >= QUEUE_MAX) {
         pthread_mutex_unlock(&queue_mutex);
         close(fd);
         return;
     }
-
-    struct job_fd_entry *job = get_job_fd();
-    if (job == NULL) {
+    struct job_fd_entry *job = alloc_job();
+    if (!job) {
         pthread_mutex_unlock(&queue_mutex);
         close(fd);
         return;
     }
-
     job->fd = fd;
     TAILQ_INSERT_TAIL(&queue_head, job, entries);
     queue_size++;
@@ -768,32 +603,27 @@ void *worker_routine(void *arg) {
     while (running) {
         struct job_fd_entry *job = NULL;
         pthread_mutex_lock(&queue_mutex);
-        while (queue_size == 0 && running) {
+        while (queue_size == 0 && running)
             pthread_cond_wait(&queue_cond, &queue_mutex);
-        }
         if (!running) {
             pthread_mutex_unlock(&queue_mutex);
             break;
         }
         job = TAILQ_FIRST(&queue_head);
-        if (job != NULL) {
+        if (job) {
             TAILQ_REMOVE(&queue_head, job, entries);
             queue_size--;
         }
         pthread_mutex_unlock(&queue_mutex);
-
-        if (job != NULL) {
+        if (job) {
             handle_client(job->fd);
-            release_job_fd(job);
+            free_job(job);
         }
     }
     return NULL;
 }
 
-static void signal_handler(int sig) {
-    (void)sig;
-    running = 0;
-}
+static void signal_handler(int sig) { (void)sig; running = 0; }
 
 static void usage(const char *prog) {
     fprintf(stderr,
@@ -820,43 +650,15 @@ static void usage(const char *prog) {
 }
 
 static inline void daemonize(void) {
-    pid_t pid;
-
-    /* Primeiro fork: sair do processo pai */
+    pid_t pid = fork();
+    if (pid < 0) { perror("fork"); exit(1); }
+    if (pid > 0) exit(0);
+    if (setsid() < 0) { perror("setsid"); exit(1); }
     pid = fork();
-    if (pid < 0) {
-        perror("fork");
-        exit(1);
-    }
-    if (pid > 0) {
-        exit(0); /* pai sai */
-    }
-
-    /* Tornar-se líder de sessão */
-    if (setsid() < 0) {
-        perror("setsid");
-        exit(1);
-    }
-
-    /* Segundo fork: garantir que não seja líder de sessão (opcional) */
-    pid = fork();
-    if (pid < 0) {
-        perror("fork2");
-        exit(1);
-    }
-    if (pid > 0) {
-        exit(0);
-    }
-
-    /* Mudar para diretório raiz (opcional - comente se quiser manter o atual) */
-    // chdir("/");
-
-    /* Redirecionar stdin, stdout, stderr para /dev/null */
+    if (pid < 0) { perror("fork2"); exit(1); }
+    if (pid > 0) exit(0);
     int fd = open("/dev/null", O_RDWR);
-    if (fd < 0) {
-        perror("open /dev/null");
-        /* Continua mesmo sem redirecionamento */
-    } else {
+    if (fd >= 0) {
         dup2(fd, STDIN_FILENO);
         dup2(fd, STDOUT_FILENO);
         dup2(fd, STDERR_FILENO);
@@ -874,14 +676,11 @@ int main(int argc, char *argv[]) {
     const char *socket_path = dmmr_env_string("DMMR_SOCKET_PATH", SOCK_PATH);
     const char *bind_address = dmmr_env_string("DMMR_BIND_ADDRESS", "127.0.0.1");
     mode_t socket_mode = (mode_t) dmmr_env_mode("DMMR_SOCKET_MODE", 0666);
-    /* Cluster discovery configuration */
     const char *seeds = dmmr_env_string("DMMR_CLUSTER_SEEDS", "");
     const char *advertise_address = dmmr_env_string("DMMR_ADVERTISE_ADDRESS", "");
     const char *cluster_name_str = dmmr_env_string("DMMR_CLUSTER_NAME", "");
-    pthread_t cluster_thread;
-    pthread_t gc_thread;
-    pthread_t reaper_thread;
-    int daemon_mode = 0;  /* 0 = foreground, 1 = daemon */
+    pthread_t cluster_thread, gc_thread, reaper_thread;
+    int daemon_mode = 0;
 
     worker_count = dmmr_env_int("DMMR_WORKERS", DEFAULT_WORKERS, 1, 1024);
 
@@ -889,59 +688,43 @@ int main(int argc, char *argv[]) {
         if (strcmp(argv[i], "--unix") == 0) use_unix = true;
         else if (strcmp(argv[i], "--tcp") == 0) use_tcp = true;
         else if (strcmp(argv[i], "--both") == 0) { use_unix = true; use_tcp = true; }
-        else if (strncmp(argv[i], "--workers=", 10) == 0) {
-            worker_count = atoi(argv[i] + 10);
-            if (worker_count < 1) worker_count = 1;
-        } else if (strncmp(argv[i], "--cluster-port=", 15) == 0) {
-            cluster_port = atoi(argv[i] + 15);
-        } else if (strncmp(argv[i], "--seeds=", 8) == 0) {
-            seeds = argv[i] + 8;
-        } else if (strncmp(argv[i], "--advertise=", 12) == 0) {
-            advertise_address = argv[i] + 12;
-        } else if (strncmp(argv[i], "--cluster-name=", 15) == 0) {
-            cluster_name_str = argv[i] + 15;
-        } else if (strncmp(argv[i], "--peer=", 7) == 0) {
+        else if (strncmp(argv[i], "--workers=", 10) == 0) worker_count = atoi(argv[i] + 10);
+        else if (strncmp(argv[i], "--cluster-port=", 15) == 0) cluster_port = atoi(argv[i] + 15);
+        else if (strncmp(argv[i], "--seeds=", 8) == 0) seeds = argv[i] + 8;
+        else if (strncmp(argv[i], "--advertise=", 12) == 0) advertise_address = argv[i] + 12;
+        else if (strncmp(argv[i], "--cluster-name=", 15) == 0) cluster_name_str = argv[i] + 15;
+        else if (strncmp(argv[i], "--peer=", 7) == 0) {
             char *spec = argv[i] + 7;
             char *colon = strchr(spec, ':');
             if (colon) {
-                char addr[64];
-                size_t len = colon - spec;
+                char addr[64]; size_t len = colon - spec;
                 if (len >= sizeof(addr)) len = sizeof(addr)-1;
-                memcpy(addr, spec, len);
-                addr[len] = '\0';
-                int port = atoi(colon+1);
-                add_peer(addr, port);
+                memcpy(addr, spec, len); addr[len] = '\0';
+                add_peer(addr, atoi(colon+1));
             }
-        } else if (strncmp(argv[i], "--node-id=", 10) == 0) {
-            my_node_id = strtoull(argv[i] + 10, NULL, 0);
-        } else if (strcmp(argv[i], "--daemon") == 0) {
-            daemon_mode = 1;
-        } else if (strcmp(argv[i], "--help") == 0) {
-            usage(argv[0]);
-            return 0;
         }
+        else if (strncmp(argv[i], "--node-id=", 10) == 0) my_node_id = strtoull(argv[i] + 10, NULL, 0);
+        else if (strcmp(argv[i], "--daemon") == 0) daemon_mode = 1;
+        else if (strcmp(argv[i], "--help") == 0) { usage(argv[0]); return 0; }
     }
 
     if (!use_unix && !use_tcp) use_unix = true;
-    if (use_unix && strlen(socket_path) >= sizeof(((struct sockaddr_un *) 0)->sun_path)) {
-        fprintf(stderr, "DMMR_SOCKET_PATH is too long: %s\n", socket_path);
-        return 1;
-    }
-    if (my_node_id == 0) {
-        my_node_id = (uint64_t) time(NULL) ^ ((uint64_t) getpid() << 32);
-    }
-
-    if (daemon_mode) {
-        daemonize();
-    }
+    if (my_node_id == 0) my_node_id = (uint64_t) time(NULL) ^ ((uint64_t) getpid() << 32);
+    if (daemon_mode) daemonize();
 
     signal(SIGINT, signal_handler);
     signal(SIGTERM, signal_handler);
     signal(SIGPIPE, SIG_IGN);
 
-    /* Inicializar pools de objetos (antes de qualquer uso) */
+    if (dmmr_heap_pool_init(&job_pool, sizeof(struct job_fd_entry), QUEUE_MAX) != 0 ||
+        dmmr_heap_pool_init(&cmd_pool, sizeof(struct control_cmd_pooled), QUEUE_MAX * 2) != 0 ||
+        dmmr_heap_pool_init(&del_pool, sizeof(struct delete_entry), TTL_SCAN_CHUNK_SIZE * 4) != 0) {
+        fprintf(stderr, "Falha ao inicializar pools fixos\n");
+        return 1;
+    }
+
     if (init_pools() != 0) {
-        fprintf(stderr, "Falha ao inicializar pools\n");
+        fprintf(stderr, "Falha ao inicializar payload pool\n");
         return 1;
     }
 
@@ -953,70 +736,29 @@ int main(int argc, char *argv[]) {
     TAILQ_INIT(&queue_head);
     TAILQ_INIT(&control_head);
     TAILQ_INIT(&gc_queue);
-    memset(job_fd_pool_used, 0, sizeof(job_fd_pool_used));
-
     init_peers();
 
     worker_threads = malloc(sizeof(pthread_t) * worker_count);
-    if (!worker_threads) {
-        fprintf(stderr, "Falha ao alocar workers\n");
-        close_db();
-        destroy_pools();
-        return 1;
-    }
+    for (int i = 0; i < worker_count; i++)
+        pthread_create(&worker_threads[i], NULL, worker_routine, NULL);
 
-    for (int i = 0; i < worker_count; i++) {
-        if (pthread_create(&worker_threads[i], NULL, worker_routine, NULL) != 0) {
-            perror("pthread_create worker");
-            running = 0;
-            break;
-        }
-    }
+    pthread_create(&cluster_thread, NULL, cluster_listener, &cluster_port);
+    pthread_create(&reaper_thread, NULL, peer_reaper_thread, NULL);
 
-    if (pthread_create(&cluster_thread, NULL, cluster_listener, &cluster_port) != 0) {
-        perror("pthread_create cluster");
-        running = 0;
-    }
+    const char *adv = advertise_address[0] ? advertise_address : bind_address;
+    cluster_configure(adv, cluster_port, seeds, 10, cluster_name_str);
+    cluster_start_discovery();
 
-    if (pthread_create(&reaper_thread, NULL, peer_reaper_thread, NULL) != 0) {
-        perror("pthread_create reaper");
-        running = 0;
-    }
-
-    /* Configurar e iniciar o discovery automático do cluster */
-    {
-        const char *adv = (advertise_address[0] != '\0') ? advertise_address : bind_address;
-        cluster_configure(adv, cluster_port, seeds, 10, cluster_name_str);
-    }
-    if (cluster_start_discovery() != 0) {
-        fprintf(stderr, "Aviso: falha ao iniciar discovery de cluster\n");
-    }
-
-    /* Cria sockets de escuta */
     if (use_unix) {
         unix_fd = socket(AF_UNIX, SOCK_STREAM, 0);
         if (unix_fd >= 0) {
-            struct sockaddr_un addr;
-            memset(&addr, 0, sizeof(addr));
-            addr.sun_family = AF_UNIX;
-            (void)strlcpy(addr.sun_path, socket_path, sizeof(addr.sun_path));
+            struct sockaddr_un addr = { .sun_family = AF_UNIX };
+            strlcpy(addr.sun_path, socket_path, sizeof(addr.sun_path));
             unlink(socket_path);
-            if (bind(unix_fd, (struct sockaddr *)&addr, sizeof(addr)) == 0 &&
-                listen(unix_fd, SOMAXCONN) == 0) {
-                if (chmod(socket_path, socket_mode) != 0) {
-                    perror("chmod unix socket");
-                    close(unix_fd);
-                    unlink(socket_path);
-                    unix_fd = -1;
-                } else {
-                    listen_fds[listen_count++] = unix_fd;
-                    printf("Unix socket: %s (mode %04o)\n", socket_path, socket_mode);
-                }
-            } else {
-                perror("unix bind/listen");
-                close(unix_fd);
-                unix_fd = -1;
-            }
+            if (bind(unix_fd, (struct sockaddr*)&addr, sizeof(addr)) == 0 && listen(unix_fd, SOMAXCONN) == 0) {
+                chmod(socket_path, socket_mode);
+                listen_fds[listen_count++] = unix_fd;
+            } else { close(unix_fd); unix_fd = -1; }
         }
     }
 
@@ -1025,154 +767,63 @@ int main(int argc, char *argv[]) {
         if (tcp_fd >= 0) {
             int opt = 1;
             setsockopt(tcp_fd, SOL_SOCKET, SO_REUSEADDR, &opt, sizeof(opt));
-            setsockopt(tcp_fd, IPPROTO_TCP, TCP_NODELAY, &opt, sizeof(opt));
-
-            struct sockaddr_in addr;
-            memset(&addr, 0, sizeof(addr));
-            addr.sin_family = AF_INET;
-            if (inet_pton(AF_INET, bind_address, &addr.sin_addr) != 1) {
-                fprintf(stderr, "Invalid DMMR_BIND_ADDRESS (IPv4 required): %s\n", bind_address);
-                close(tcp_fd);
-                tcp_fd = -1;
-            }
-            if (tcp_fd >= 0) {
-                addr.sin_port = htons((uint16_t) cache_port);
-                if (bind(tcp_fd, (struct sockaddr *)&addr, sizeof(addr)) == 0 &&
-                    listen(tcp_fd, SOMAXCONN) == 0) {
-                    listen_fds[listen_count++] = tcp_fd;
-                    printf("TCP socket: %s:%d\n", bind_address, cache_port);
-                } else {
-                    perror("tcp bind/listen");
-                    close(tcp_fd);
-                    tcp_fd = -1;
-                }
-            }
+            struct sockaddr_in addr = { .sin_family = AF_INET };
+            inet_pton(AF_INET, bind_address, &addr.sin_addr);
+            addr.sin_port = htons((uint16_t)cache_port);
+            if (bind(tcp_fd, (struct sockaddr*)&addr, sizeof(addr)) == 0 && listen(tcp_fd, SOMAXCONN) == 0) {
+                listen_fds[listen_count++] = tcp_fd;
+            } else { close(tcp_fd); tcp_fd = -1; }
         }
     }
 
-    if (listen_count == 0) {
-        fprintf(stderr, "Nenhum socket de escuta disponível.\n");
-        running = 0;
-    } else {
-        printf("Workers: %d, Node ID: %llu\n", worker_count, (unsigned long long) my_node_id);
-    }
-
-    /* Threads de controle, broadcast e GC */
     pthread_t control_thread;
     pthread_create(&control_thread, NULL, control_thread_routine, NULL);
-    for (int i = 0; i < BROADCAST_WORKERS; i++) {
+    for (int i = 0; i < BROADCAST_WORKERS; i++)
         pthread_create(&broadcast_workers[i], NULL, broadcast_worker_routine, NULL);
-    }
-    /* Thread do Garbage Collector */
     pthread_create(&gc_thread, NULL, gc_worker_routine, NULL);
 
-/* ============================================================
- * (C) Loop principal de accept – usando select() (POSIX)
- * ============================================================ */
-fd_set readfds;
-int max_fd = -1;
+    fd_set readfds;
+    int max_fd = -1;
+    for (int i = 0; i < listen_count; i++)
+        if (listen_fds[i] > max_fd) max_fd = listen_fds[i];
 
-/* Encontra o maior descritor para o select */
-for (int i = 0; i < listen_count; i++) {
-    if (listen_fds[i] > max_fd) {
-        max_fd = listen_fds[i];
-    }
-}
-
-while (running) {
-    FD_ZERO(&readfds);
-    for (int i = 0; i < listen_count; i++) {
-        if (listen_fds[i] >= 0) {
-            FD_SET(listen_fds[i], &readfds);
+    while (running) {
+        FD_ZERO(&readfds);
+        for (int i = 0; i < listen_count; i++)
+            if (listen_fds[i] >= 0) FD_SET(listen_fds[i], &readfds);
+        struct timeval tv = { .tv_sec = 1 };
+        if (select(max_fd+1, &readfds, NULL, NULL, &tv) > 0) {
+            for (int i = 0; i < listen_count; i++)
+                if (FD_ISSET(listen_fds[i], &readfds)) {
+                    int client = accept(listen_fds[i], NULL, NULL);
+                    if (client >= 0) enqueue_job(client);
+                }
         }
     }
 
-    /* Timeout de 1 segundo para verificar running periodicamente */
-    struct timeval tv;
-    tv.tv_sec = 1;
-    tv.tv_usec = 0;
-
-    int ready = select(max_fd + 1, &readfds, NULL, NULL, &tv);
-    if (ready < 0) {
-        if (errno == EINTR) continue;
-        perror("select");
-        break;
-    }
-    if (ready == 0) {
-        /* Timeout: apenas reavalia running */
-        continue;
-    }
-
-    for (int i = 0; i < listen_count; i++) {
-        if (listen_fds[i] >= 0 && FD_ISSET(listen_fds[i], &readfds)) {
-            struct sockaddr_storage client_addr;
-            socklen_t addrlen = sizeof(client_addr);
-            int client_fd = accept(listen_fds[i], (struct sockaddr *)&client_addr, &addrlen);
-            if (client_fd < 0) {
-                if (errno != EAGAIN && errno != EWOULDBLOCK)
-                    perror("accept");
-                continue;
-            }
-            enqueue_job(client_fd);
-        }
-    }
-}
-
-    /* ============================================================
-     * Shutdown
-     * ============================================================ */
     running = 0;
-
-    /* Acorda a thread de controle */
     pthread_cond_signal(&control_cond);
     pthread_join(control_thread, NULL);
-
-    /* Acorda os broadcast workers */
     pthread_cond_broadcast(&broadcast_cond);
-    for (int i = 0; i < BROADCAST_WORKERS; i++) {
-        pthread_join(broadcast_workers[i], NULL);
-    }
-
-    /* Acorda o GC */
+    for (int i = 0; i < BROADCAST_WORKERS; i++) pthread_join(broadcast_workers[i], NULL);
     pthread_cond_signal(&gc_cond);
     pthread_join(gc_thread, NULL);
-
-    /* Fechar cursor persistente do GC */
-    pthread_mutex_lock(&gc_cursor_mutex);
-    if (gc_cursor != NULL) {
-        gc_cursor->close(gc_cursor);
-        gc_cursor = NULL;
-    }
-    pthread_mutex_unlock(&gc_cursor_mutex);
-
-    /* Acorda os workers de job */
     pthread_mutex_lock(&queue_mutex);
     pthread_cond_broadcast(&queue_cond);
     pthread_mutex_unlock(&queue_mutex);
-
-    for (int i = 0; i < worker_count; i++) {
-        pthread_join(worker_threads[i], NULL);
-    }
+    for (int i = 0; i < worker_count; i++) pthread_join(worker_threads[i], NULL);
     free(worker_threads);
-
-    /* O listener de cluster pode estar bloqueado em accept().  Feche-o
-     * antes do join para acordar a thread e permitir o shutdown gracioso. */
     cluster_stop_discovery();
     cluster_close_listener();
     pthread_join(cluster_thread, NULL);
-
     pthread_join(reaper_thread, NULL);
-
-    /* Fechar conexões persistentes de cluster */
     close_peer_connections();
-
-    if (unix_fd >= 0) {
-        close(unix_fd);
-        unlink(socket_path);
-    }
+    if (unix_fd >= 0) { close(unix_fd); unlink(socket_path); }
     if (tcp_fd >= 0) close(tcp_fd);
-
     close_db();
     destroy_pools();
+    dmmr_heap_pool_destroy(&job_pool);
+    dmmr_heap_pool_destroy(&cmd_pool);
+    dmmr_heap_pool_destroy(&del_pool);
     return 0;
 }

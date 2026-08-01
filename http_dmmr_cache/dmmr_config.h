@@ -39,6 +39,13 @@
 #define POOL_INITIAL_SIZE 0x400   // tamanho inicial dos pools (1024 entradas)
 
 /*
+ * Fixed response slots used by process_frame().  This is deliberately much
+ * smaller than QUEUE_MAX: a slot is held only while a worker reads a value
+ * from Berkeley DB and writes the response to the client.
+ */
+#define NODE_RECV_POOL_SLOTS 16
+
+/*
  * Container/runtime configuration.  Defaults intentionally preserve the
  * command-line behaviour used by the existing test suite.
  */

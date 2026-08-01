@@ -645,7 +645,7 @@ class DMMRTestSuite(BaseIntegrationTest):
         cls.http = HttpClient()
 
         cls.backend_mgr.start_all()
-        cls.cache_mgr.start(['--unix', '--tcp'])
+        cls.cache_mgr.start(['--both'])
 
         cls._seed_auth_keys()
 

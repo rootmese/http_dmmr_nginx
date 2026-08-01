@@ -33,6 +33,12 @@ int db_get_with_meta(const char *key, size_t key_len,
                      void **value_out, size_t *value_len_out,
                      uint64_t *expire_at_out);
 
+/* Reads the value into caller-owned memory; no malloc/free is performed. */
+int db_get_with_meta_into(const char *key, size_t key_len,
+                          uint64_t *ts_out, uint64_t *node_id_out,
+                          void *record_buf, size_t record_buf_len,
+                          size_t *value_len_out, uint64_t *expire_at_out);
+
 int db_set_with_meta(const char *key, size_t key_len,
                      uint64_t ts, uint64_t node_id,
                      const void *value, size_t value_len, uint64_t expire_at);

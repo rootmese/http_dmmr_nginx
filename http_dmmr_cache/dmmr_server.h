@@ -1,12 +1,13 @@
 #ifndef DMMR_SERVER_H
 #define DMMR_SERVER_H
 
-#include "dmmr_protocol.h"
 #include <stdbool.h>
 #include <stdint.h>
 #include <time.h>
+#include "dmmr_protocol.h"   // <-- necessário para struct dmmr_frame
+#include "dmmr_pool.h"       // opcional (já que usa struct payload_buf*)
 
-struct payload_buf;
+struct payload_buf;          // mantido para clareza
 
 static inline uint64_t now_micros(void) {
     struct timespec ts;
@@ -20,4 +21,4 @@ int read_frame(int fd, struct dmmr_frame *frame, uint8_t **payload,
                struct payload_buf **payload_buf,
                bool *is_legacy, uint16_t *legacy_opcode, uint16_t *legacy_key_len);
 
-#endif /* DMMR_SERVER_H */
+#endif

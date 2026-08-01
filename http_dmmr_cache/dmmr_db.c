@@ -55,7 +55,7 @@ static int put_record_locked(const char *key, size_t key_len,
     int rc;
 
     total_len = sizeof(*entry) + (tombstone ? 0 : value_len);
-    buffer = malloc(total_len);
+    buffer = calloc(total_len, 1);
     if (buffer == NULL) {
         return DMMR_DB_ERROR;
     }
@@ -168,7 +168,7 @@ int db_get_with_meta(const char *key, size_t key_len,
         *expire_at_out = entry->expire_at;
     }
     if (value_out != NULL && value_len > 0) {
-        *value_out = malloc(value_len);
+        *value_out = calloc(value_len, 1);
         if (*value_out == NULL) {
             free(data_dbt.data);
             pthread_mutex_unlock(&db_mutex);
@@ -349,7 +349,7 @@ int db_snapshot_foreach(dmmr_db_snapshot_cb callback, void *arg)
 
         value_len = dmmr_record_value_len(entry);
         memset(&record, 0, sizeof(record));
-        record.key = malloc(key_dbt.size);
+        record.key = calloc(key_dbt.size, 1);
         if (record.key == NULL) {
             free(data_dbt.data);
             rc = DMMR_DB_ERROR;
@@ -363,7 +363,7 @@ int db_snapshot_foreach(dmmr_db_snapshot_cb callback, void *arg)
         record.tombstone = dmmr_record_is_tombstone(entry);
         record.value_len = value_len;
         if (value_len > 0) {
-            record.value = malloc(value_len);
+            record.value = calloc(value_len, 1);
             if (record.value == NULL) {
                 free(record.key);
                 free(data_dbt.data);

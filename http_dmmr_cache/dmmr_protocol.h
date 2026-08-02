@@ -22,6 +22,9 @@ enum dmmr_opcode {
     OP_PING = 10,
     OP_STATUS = 11,
     OP_STATS = 12,
+    OP_AUTH_REQUEST  = 13,
+    OP_AUTH_RESPONSE = 14,
+    OP_AUTH_OK       = 15,
 };
 
 enum dmmr_flags {

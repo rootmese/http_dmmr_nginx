@@ -3,7 +3,6 @@
 #include "dmmr_protocol.h"
 #include "dmmr_net.h"
 #include "dmmr_db.h"
-#include "dmmr_cluster.h"
 #include "dmmr_pool.h"
 #include "dmmr_heap_pool.h"
 #include "dmmr_string.h"
@@ -679,6 +678,7 @@ int main(int argc, char *argv[]) {
     const char *seeds = dmmr_env_string("DMMR_CLUSTER_SEEDS", "");
     const char *advertise_address = dmmr_env_string("DMMR_ADVERTISE_ADDRESS", "");
     const char *cluster_name_str = dmmr_env_string("DMMR_CLUSTER_NAME", "");
+    const char *cluster_secret_str = dmmr_env_string("DMMR_CLUSTER_SECRET", "");
     pthread_t cluster_thread, gc_thread, reaper_thread;
     int daemon_mode = 0;
 
@@ -693,6 +693,7 @@ int main(int argc, char *argv[]) {
         else if (strncmp(argv[i], "--seeds=", 8) == 0) seeds = argv[i] + 8;
         else if (strncmp(argv[i], "--advertise=", 12) == 0) advertise_address = argv[i] + 12;
         else if (strncmp(argv[i], "--cluster-name=", 15) == 0) cluster_name_str = argv[i] + 15;
+        else if (strncmp(argv[i], "--cluster-secret=", 17) == 0) cluster_secret_str = argv[i] + 17;
         else if (strncmp(argv[i], "--peer=", 7) == 0) {
             char *spec = argv[i] + 7;
             char *colon = strchr(spec, ':');
@@ -746,7 +747,13 @@ int main(int argc, char *argv[]) {
     pthread_create(&reaper_thread, NULL, peer_reaper_thread, NULL);
 
     const char *adv = advertise_address[0] ? advertise_address : bind_address;
-    cluster_configure(adv, cluster_port, seeds, 10, cluster_name_str);
+    cluster_configure(
+        adv,
+        cluster_port,
+        seeds,
+        10,
+        cluster_name_str,
+        cluster_secret_str);
     cluster_start_discovery();
 
     if (use_unix) {

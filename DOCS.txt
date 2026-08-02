@@ -75,6 +75,9 @@ Runtime environment variables:
 - DMMR_WORKERS: number of cache workers (default 4)
 - DMMR_SOCKET_PATH: Unix socket path (default /tmp/dmmr_cache.sock)
 - DMMR_SOCKET_MODE: Unix socket mode in octal, for example 0660 or 0666
+- DMMR_CLUSTER_SECRET: shared secret for cluster peer authentication.
+  -- When set, peers perform an HMAC-SHA256 handshake before exchanging data.
+  -- Sessions expire after 10 minutes. Optional; if empty, authentication is disabled.
 
 CLI Options for Cluster:
 - --seeds=IP:PORT,...    Seeds for cluster discovery

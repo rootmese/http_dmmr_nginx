@@ -217,6 +217,18 @@ Cluster isolation is guaranteed by `DMMR_CLUSTER_NAME` (or `--cluster-name`): no
 
 ---
 
+### Cluster Authentication (Shared Secret)
+
+To prevent unauthorized nodes from joining the synchronization mesh, the cluster supports mutual authentication via a shared secret (`DMMR_CLUSTER_SECRET` or `--cluster-secret`). When set, every TCP connection between peers performs a three-step handshake (`OP_AUTH_REQUEST`, `OP_AUTH_RESPONSE`, and `OP_AUTH_OK`) using HMAC-SHA256. Authenticated sessions expire after 10 minutes (`AUTH_TTL_MICROS`), requiring periodic re-authentication.
+
+- If the secret is omitted or empty, authentication is disabled (insecure mode, backward-compatible with previous versions).
+- The secret must be identical across all nodes in the cluster.
+- Example:
+  ```bash
+  ./dmmr_cache --tcp --cluster-name=production --cluster-secret=mySuperSecret --advertise=10.0.0.1
+
+---
+
 ## 📡 DMMR Binary Protocol Specification
 
 All communication between Nginx (or test clients) and the cache service uses a custom binary protocol.

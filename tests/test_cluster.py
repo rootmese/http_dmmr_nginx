@@ -32,7 +32,8 @@ for n in nodes:
         "--cluster-name=testcluster",
         f"--seeds={seeds}",
         "--advertise=127.0.0.1",
-        "--node-id=0"
+        "--node-id=0",
+        "--cluster-secret=testsecret"    # <-- segredo compartilhado
     ]
     env = os.environ.copy()
     env["DMMR_CACHE_PORT"] = str(n["port"])

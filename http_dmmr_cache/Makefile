@@ -1,5 +1,13 @@
 TARGET = dmmr_cache
-OBJS = dmmr_net.o dmmr_db.o dmmr_cluster.o dmmr_pool.o dmmr_heap_pool.o dmmr_string.o dmmr_server.o
+OBJS = \
+    dmmr_net.o \
+    dmmr_db.o \
+    dmmr_cluster.o \
+    dmmr_pool.o \
+    dmmr_heap_pool.o \
+    dmmr_string.o \
+    dmmr_server.o \
+    sha256.o
 
 # Prefer the libc implementation when it is declared and linkable.  Otherwise
 # dmmr_string.c supplies the OpenBSD-compatible fallback.

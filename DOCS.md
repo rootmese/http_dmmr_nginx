@@ -47,6 +47,14 @@ The cache service has been hardened in several areas:
 - Peer management includes a reaper for stale or dead nodes, helping avoid leaked resources and orphaned state.
 - Cluster communication validates cluster identity and supports discovery from both seeds and already-known peers.
 
+### Cluster Security (Authentication)
+
+Since version 0.2.0-beta, the cache daemon supports mutual authentication between cluster peers using a shared secret. The handshake is performed immediately after the TCP connection is established and before any synchronization messages are exchanged. New opcodes `OP_AUTH_REQUEST`, `OP_AUTH_RESPONSE`, and `OP_AUTH_OK` were added to the protocol to support this flow.
+
+Authentication uses HMAC-SHA256 with randomly generated nonces and an expiration timestamp. Authenticated sessions are valid for 10 minutes, after which the peer must re-authenticate. If the handshake fails, the connection is closed and a new attempt is scheduled with exponential backoff.
+
+This security layer is optional: if `DMMR_CLUSTER_SECRET` is not set, the behavior remains unchanged from previous versions (no authentication).
+
 ## How Authentication Works
 
 When a request arrives with an API key, the Nginx module tries to query the cache daemon.
